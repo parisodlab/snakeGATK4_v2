@@ -1,0 +1,12 @@
+name: gatk4_calling_env
+channels:
+    - conda-forge
+    - bioconda
+    - defaults
+    - R
+dependencies:
+    - gatk4=4.1.3
+# gatkv4.1.3 apparantly has quality score on invariant sites 
+    - bcftools=1.20
+    - vcflib=1.0.3
+    - multiqc

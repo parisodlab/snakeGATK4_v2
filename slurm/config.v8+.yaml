@@ -1,0 +1,32 @@
+executor: cluster-generic
+cluster-generic-submit-cmd:
+  mkdir -p logs/{rule} &&
+  sbatch
+    --parsable
+    --cpus-per-task={threads}
+    --time={resources.time}
+    --mem={resources.mem_mb}
+    --job-name=smk-{rule}-{wildcards}
+    --output=logs/{rule}/{rule}-{wildcards}.out
+    --error=logs/{rule}/{rule}-{wildcards}.err
+    --partition={resources.partition}
+default-resources:
+  - time='10:00:00'
+  - partition='pibu_el8'
+  - tmpdir='/scratch'
+  - mem_mb=10000
+rerun-triggers: mtime
+restart-times: 0
+max-jobs-per-second: 10
+max-status-checks-per-second: 1
+local-cores: 1
+latency-wait: 60
+jobs: 500
+keep-going: True
+rerun-incomplete: True
+printshellcmds: True
+scheduler: greedy
+use-conda: True
+conda-frontend: mamba
+cluster-generic-status-cmd: status-sacct-robust.sh
+cluster-generic-cancel-cmd: scancel

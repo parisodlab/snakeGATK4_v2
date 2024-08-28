@@ -1,0 +1,167 @@
+import pandas as pd
+import numpy as np
+import os
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+OUTDIR=final_path + "/freebayes/"
+
+GENOME = config["GENOME"]
+SCAFFS=config["SCAFFOLDS"]
+scaffolds = []
+
+if SCAFFS=="ALL":
+    with open(GENOME,'rt') as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                line = line.split(" ")[0]
+                scaffolds.append(line[1:])
+else:
+    with open(SCAFFS,'rt') as sh:
+        for line in sh:
+            line = line.strip()
+            scaffolds.append(line)
+
+with open("scaffolds.list", "w") as outfile:
+    outfile.write("\n".join(scaffolds))
+
+
+sample=samples["sample"]
+prefix=samples["prefix"]
+
+wildcard_constraints:
+    prefix = "|".join(samples.index),
+    sample = "|".join(samples["sample"]),
+    scaffold = "|".join(scaffolds)
+
+
+units = pd.read_csv(config["METAFILE"],sep='\t')[["sample","prefix"]]
+dunits = units.groupby('sample').agg(lambda x: x.tolist()).to_dict('index')
+
+
+
+BAM_LIST_FILE=final_path + "/freebayes/bam.list"
+REGIONS_FILE=final_path + "/freebayes/regions/regions_list.tsv"
+PLOIDY = config["PLOIDY"]
+THETA = config["FreeBayes"]["theta"] # mutation rate / expected pairwise nucleotide diversity (freebayes default 0.001)
+MAX_COMPLEX_GAP = config["FreeBayes"]["max_complex_gap"] #  Allow haplotype calls with contiguous embedded matches of up to this length. Set N=-1 to disable clumping. (freebayes default: 3).  Read length/2 should be safe
+USE_BEST_N_ALLELES = config["FreeBayes"]["use_best_n_alleles"]# limit number of alleles to consider; 0 for all.  @TCC for some problematic regions, otherwise runs forever
+MIN_BASE_QUALITY = config["FreeBayes"]["min_base_quality"]
+MIN_MAPPING_QUALITY = config["FreeBayes"]["min_mapping_quality"]
+NICE_LEVEL = 9
+
+
+
+
+def read_list_file(filename):
+    with open(filename) as f:
+        items = [x for x in f.read().split('\n') if len(x) > 0]  # we dont want empty lines
+    return items
+
+def regions_file_to_fbregion_outfiles():
+    with open(REGIONS_FILE) as f:
+        lines = [x.split() for x in f.read().split('\n') if len(x) > 0]  # we dont want empty lines
+    return sorted([ os.path.join(OUTDIR, "vcf/fbregion-{:06d}.{}:{}-{}.vcf.gz".format(i,x[0],x[1],x[2])) for i,x in enumerate(lines) ])
+
+
+
+# variant calling with freebayes with --report-monomorphic
+
+rule end:
+    input:
+        REGIONS_FILE
+
+rule GenerateFreebayesParams:
+    input:
+        ref=GENOME,
+        index=GENOME + ".fai",
+        bams=expand(final_path + "/dedup/{sample}.bam", sample=sample)
+    output:
+        bamlist= BAM_LIST_FILE,
+        pops=final_path + "/freebayes/populations.tsv"
+    params:
+        metadata=config["METAFILE"],
+        scaffold=scaffolds,
+        final_path=final_path
+    conda:
+        "../env/freebayes_calling_env.yaml"
+    log:
+        "logs/freebayes_params.log"
+    script:
+        "../scripts/GenerateFreebayesParams.R"
+
+
+
+rule VariantCallingFreebayes:
+    input:
+        BAM_LIST_FILE,
+        ref=GENOME
+    output:
+        out=os.path.join(OUTDIR, "vcf/fbregion-{scaffold}.vcf.gz")
+    shell:
+        """
+        freebayes \
+        --region {wildcards.scaffold} \
+        --fasta-reference {input.ref} 
+        --ploidy {PLOIDY} \
+        --theta {THETA} \
+        --max-complex-gap {MAX_COMPLEX_GAP} \
+        --use-best-n-alleles {USE_BEST_N_ALLELES} \
+        --min-repeat-entropy 1 \
+        --no-partial-observations \
+        --report-genotype-likelihood-max \
+        --no-population-priors \
+        --report-monomorphic \
+        --min-base-quality {MIN_BASE_QUALITY} \
+        --min-mapping-quality {MIN_MAPPING_QUALITY} \
+        --bam-list {input} \
+        --genotype-qualities \
+        | bgzip -c > {output}.part 
+        mv '{output}.part' '{output}'
+        """
+        
+
+# NOTES
+# --use-best-n-alleles "+str(USE_BEST_N_ALLELES) + # performance fix... 0 to disable
+# --min-repeat-entropy 1 #  # https://github.com/ekg/freebayes/issues/272
+# --no-partial-observations #  # https://github.com/ekg/freebayes/issues/272
+# --min-alternate-fraction 0.05 #   # https://github.com/ekg/freebayes/issues/272 (@TCC more for higher depth?)
+# --report-genotype-likelihood-max #  # option suggested by EKG for no population assumptions
+# --no-population-priors #  # option suggested by EKG for no population assumptions
+# --standard-filters # Equivalent to -m 30 -q 20 -R 0 -S 0
+# --exclude-unobserved-genotypes # this keeps GL from being output
+# --min-base-quality 20 # # standard-filters=20
+# --min-mapping-quality 30 # standard-filters=30
+# --genotype-qualities # remove for speed+memory optimization
+# --use-mapping-quality # caps base quality at mapping quality for read; apparently not commonly used
+
+
+
+rule ConcatVCFsFreebayes:
+    input:
+        region_file=REGIONS_FILE,
+        vcfs= expand(OUTDIR, "vcf/fbregion-{scaffold}.vcf.gz", scaffold=scaffolds)
+        vcf_indexes=expand(OUTDIR, "vcf/fbregion-{scaffold}.vcf.gz.tbi", scaffold=scaffolds)
+    output:
+        out=OUTDIR + "final_vcf/raw.vcf.gz",
+        listfile=OUTDIR + "final_vcf/vcfs.list"
+    shell:
+        """
+        python scripts/regions_list_to_vcfs_list.py {input.region_file} > {output.listfile} 
+        bcftools concat --allow-overlaps --rm-dups all -O z -o '{output.out}' -f {output.listfile}"
+        """
+
+rule filterFreebayes:
+    input:
+        OUTDIR + "final_vcf/raw.vcf.gz",
+        ref=GENOME
+    output:
+        out=OUTDIR, "final_vcf/filtered.vcf.gz"
+    threads: 2
+    shell:
+        """
+        bcftools view --trim-alt-alleles --exclude-uncalled -O v '{input}' | vcffilter -f 'QUAL > 1 & SAF > 0 & SAR > 0 & RPR > 1 & RPL > 1' | vcfwave | bcftools norm --fasta-ref '{input.ref}' --check-ref e | vcffixup - | bcftools view --trim-alt-alleles --min-ac 1 --min-alleles 2 --exclude-uncalled -O z > {output.out}
+        """
+

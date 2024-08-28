@@ -1,0 +1,373 @@
+import pandas as pd
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+
+GENOME = config["GENOME"]
+SCAFFS=config["SCAFFOLDS"]
+scaffolds = []
+
+if SCAFFS=="ALL":
+    with open(GENOME,'rt') as fh:
+        for line in fh:
+            line = line.strip()
+            if line.startswith(">"):
+                line = line.split(" ")[0]
+                scaffolds.append(line[1:])
+else:
+    with open(SCAFFS,'rt') as sh:
+        for line in sh:
+            line = line.strip()
+            scaffolds.append(line)
+
+with open("scaffolds.list", "w") as outfile:
+    outfile.write("\n".join(scaffolds))
+
+
+sample=samples["sample"]
+prefix=samples["prefix"]
+
+wildcard_constraints:
+    prefix = "|".join(samples.index),
+    sample = "|".join(samples["sample"]),
+    scaffold = "|".join(scaffolds)
+
+
+
+
+units = pd.read_csv(config["METAFILE"],sep='\t')[["sample","prefix"]]
+dunits = units.groupby('sample').agg(lambda x: x.tolist()).to_dict('index')
+
+
+# Define a function to get the fastq files for a given prefix
+def get_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": fastqs.fq1, "r2": fastqs.fq2}
+
+def get_trimmed_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": os.path.join(final_path + "/gatk4data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join(final_path + "/gatk4data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
+
+
+rule end:
+    input:
+        "sample_map.txt",
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/af_filtered.stats.txt",
+        final_path + "/gatk4/final_vcf/multiqc_report.html"
+        
+
+rule CreateDict:
+    input:
+        GENOME
+    output:
+        GENOME.rstrip(".fasta") + ".dict"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk CreateSequenceDictionary -R {input} -O {output}
+        """
+
+rule WriteSampleMap:
+    input:
+        config["METAFILE"]
+    output:
+        "sample_map.txt"
+    run:
+        import pandas as pd
+        sam = pd.read_csv(config["METAFILE"],sep='\t').set_index(["sample"], drop=False)
+        sam['gvcf']= [final_path + "/gatk4/gvcf/" +y+ ".g.vcf.gz" for y in sam.index]
+        fsam = sam[['sample','gvcf']].drop_duplicates()
+        fsam.to_csv(path_or_buf="sample_map.txt",columns=['sample','gvcf'],sep='\t',index=False,header=False)
+
+
+rule haplotypecaller:
+    input:
+        bam=final_path + "/dedup/{sample}.bam",
+        bai=final_path + "/dedup/{sample}.bam.bai",
+        reference=GENOME,
+        dict_genome=GENOME.rstrip(".fasta") + ".dict"
+    output:
+        vcf=final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz",
+        vcfidx=final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/haplotypecaller/haplotypecaller_{sample}_{scaffold}.txt"
+    threads:
+        4
+    params:
+        outputpath = final_path + "/gatk4/gvcf",
+        stand_call_conf = config["HaplotypeCaller"]["minConfidenceForVariantCalling"]
+    resources:
+        mem_mb = 8000
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        # --do-not-run-physical-phasing  since it will later contradict with het pol genotypes https://github.com/AndersenLab/wi-gatk/pull/24/commits/ea7c64eb69bd0ecf75602ef646cc7a0fb7f82a83
+        gatk --java-options "-Xms6G -Xmx6G -XX:ConcGCThreads={threads}" HaplotypeCaller \
+            --emit-ref-confidence GVCF \
+            -R {input.reference} \
+            -I {input.bam} \
+            -O {output.vcf} \
+            -L {wildcards.scaffold} \
+            --annotation DepthPerAlleleBySample \
+            --annotation Coverage \
+            --annotation GenotypeSummaries \
+            --annotation TandemRepeat \
+            --annotation StrandBiasBySample \
+            --annotation ChromosomeCounts \
+            --annotation ReadPosRankSumTest \
+            --annotation AS_ReadPosRankSumTest \
+            --annotation AS_QualByDepth \
+            --annotation AS_StrandOddsRatio \
+            --annotation AS_MappingQualityRankSumTest \
+            --annotation DepthPerSampleHC \
+            --annotation-group StandardAnnotation \
+            --annotation-group AS_StandardAnnotation \
+            --annotation-group StandardHCAnnotation \
+            --do-not-run-physical-phasing \
+            --standard-min-confidence-threshold-for-calling {params.stand_call_conf} 
+        """
+
+rule mergeSampleGvcfs:
+    input:
+        expand(final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz", sample=sample, scaffold=scaffolds)
+    output:
+        final_path + "/gatk4/gvcf/{sample}.g.vcf.gz",
+        final_path + "/gatk4/gvcf/{sample}.g.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/mergeSampleGvcfs/mergeSampleGvcfs_{sample}.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/gvcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        awk '{{ print "{params.outputpath}" $0 "_{wildcards.sample}.g.vcf.gz" }}' scaffolds.list > {params.outputpath}{wildcards.sample}_gvcfs.list
+        bcftools concat  -O z --file-list {params.outputpath}{wildcards.sample}_gvcfs.list > {output[0]}
+        bcftools index --tbi {output[0]}
+        """
+
+rule GenomicsDBImport:
+    input:
+        "sample_map.txt",
+        expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz", sample=sample)
+    output:
+        directory(final_path + "/gatk4/genomicsDB/{scaffold}.db")
+    benchmark:
+        "benchmarks/GenomicsDBImport/GenomicsDBImport_{scaffold}.txt"
+    threads:
+        8
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/genomicsDB"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk --java-options "-Xms6G -Xmx6G -XX:ConcGCThreads={threads}" GenomicsDBImport \
+            --genomicsdb-workspace-path {output[0]} \
+            -L {wildcards.scaffold} \
+            --sample-name-map sample_map.txt \
+            --reader-threads {threads} \
+            --batch-size 16 \
+            --intervals {wildcards.scaffold} 
+        """
+
+rule GenotypeGVCFs:
+    input:
+        db=final_path + "/gatk4/genomicsDB/{scaffold}.db",
+        reference=GENOME
+    output:
+        final_path + "/gatk4/vcf/{scaffold}.vcf.gz",
+        final_path + "/gatk4/vcf/{scaffold}.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/GenotypeGVCFs/GenotypeGVCFs_{scaffold}.txt"
+    threads:
+        12
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/vcf"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk --java-options "-Xms6G -Xmx6G -XX:ConcGCThreads={threads}" GenotypeGVCFs \
+            -R {input.reference} \
+            -V gendb://{input.db} \
+            -G StandardAnnotation \
+            -G AS_StandardAnnotation \
+            -G StandardHCAnnotation \
+            -all-sites \
+            -O {output[0]} \
+            -L {wildcards.scaffold} 
+
+        """
+
+rule ConcatVCFs:
+    input:
+        expand(final_path + "/gatk4/vcf/{scaffold}.vcf.gz", scaffold=scaffolds)
+    output:
+        final_path + "/gatk4/final_vcf/raw.vcf.gz",
+        final_path + "/gatk4/final_vcf/raw.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/ConcatVCFs/ConcatVCFs.txt"
+    threads:
+        4
+    resources: 
+        mem_mb = 8000
+    params:
+        inputpath = final_path + "/gatk4/vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        awk '{{ print "{params.inputpath}" $0 ".vcf.gz" }}' scaffolds.list > {params.inputpath}contig_set.tsv
+        bcftools concat  -O z --file-list {params.inputpath}contig_set.tsv > {output[0]}
+        bcftools index --tbi {output[0]}
+        """
+
+rule MarkFilter:
+    input:
+        final_path + "/gatk4/final_vcf/raw.vcf.gz",
+        final_path + "/gatk4/final_vcf/raw.vcf.gz.tbi"
+    output:
+        vcf=final_path + "/gatk4/final_vcf/mark-filter.vcf.gz",
+        index=final_path + "/gatk4/final_vcf/mark-filter.vcf.gz.tbi",
+        stats=final_path + "/gatk4/final_vcf/mark-filter.stats.txt",
+        filter_stats=final_path + "/gatk4/final_vcf/mark-filter.filter_stats.txt"
+    benchmark:
+        "benchmarks/SoftFilter/MarkFilter.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 16000
+    params:
+        min_depth = config["HaplotypeCaller"]["min_depth"],
+        qual = config["HaplotypeCaller"]["qual"],
+        fisherstrand = config["HaplotypeCaller"]["fisherstrand"],
+        quality_by_depth = config["HaplotypeCaller"]["quality_by_depth"],
+        strand_odds_ratio = config["HaplotypeCaller"]["strand_odds_ratio"],
+        high_missing = config["HaplotypeCaller"]["high_missing"],
+        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"],
+        GQ = config["HaplotypeCaller"]["GQ"],
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk --java-options "-Xmx12g -Xms12g" \
+            VariantFiltration \
+            --verbosity ERROR \
+            -R {GENOME} \
+            --variant {input[0]} \
+            --genotype-filter-expression "DP < {params.min_depth}"    --genotype-filter-name "DP_min_depth" \
+            --genotype-filter-expression "GQ < {params.GQ}"        --genotype-filter-name "GQ_quality" \
+            --genotype-filter-expression "RGQ < {params.GQ}"        --genotype-filter-name "RGQ_quality" \
+            --genotype-filter-expression "isHet == 1"                  --genotype-filter-name "is_het" \
+            --filter-expression "QUAL < {params.qual}"                --filter-name "QUAL_quality" \
+            --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
+            --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
+            --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
+            -O {params.outputpath}out.vcf.gz
+
+        bcftools index -f --tbi {params.outputpath}out.vcf.gz
+
+        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' {params.outputpath}out.vcf.gz |\
+        bcftools filter --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' -O z > {output.vcf}
+
+        bcftools index {output.vcf}
+        bcftools index --tbi {output.vcf}
+
+        bcftools stats --threads {threads} \
+                    -s- --verbose {output.vcf} > {output.stats}
+
+        {{
+            echo -e 'QUAL\\tQD\\tSOR\\tFS\\tFILTER';
+            bcftools query -f '%CHROM\\t%POS\\t%QUAL\\t%INFO/QD\\t%INFO/SOR\\t%INFO/FS\\t%FILTER\n' {output.vcf};
+        }}     > {output.filter_stats}
+        """
+    
+
+rule ApplyFilter:
+    input:
+        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz",
+        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz.tbi"
+    output:
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/filtered.stats.txt"
+    benchmark:
+        "benchmarks/ApplyFilter/ApplyFilter.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view -m2 -M2 --trim-alt-alleles -O u  {input[0]} |\
+            bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "DP_min_depth"' |\
+            bcftools filter -O v --exclude 'FILTER != "PASS"' |\
+            vcffixup - | \
+            bcftools view -O z --trim-alt-alleles > {params.outputpath}filtered.vcf.gz
+
+        bcftools index {params.outputpath}filtered.vcf.gz
+        bcftools index --tbi {params.outputpath}filtered.vcf.gz
+        bcftools stats -s- --verbose {params.outputpath}filtered.vcf.gz > {params.outputpath}filtered.stats.txt
+        """
+
+
+rule FilterVCFminAF:
+    input:
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi",
+    output:
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/af_filtered.stats.txt"
+    benchmark:
+        "benchmarks/FilterVCFminAF/FilterVCFminAF.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view -O v --min-af 0.000001 --max-af 0.999999 {input[0]} |\
+            vcffixup - | \
+            bcftools view -O z > {params.outputpath}af_filtered.vcf.gz
+        bcftools index {params.outputpath}af_filtered.vcf.gz
+        bcftools stats -s- --verbose {params.outputpath}af_filtered.vcf.gz > {params.outputpath}af_filtered.stats.txt
+        """
+
+rule MultiQC:
+    input:
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"
+    output:
+        final_path + "/gatk4/final_vcf/multiqc_report.html"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    shell:
+        """
+        multiqc {params.outputpath} -o {params.outputpath}
+        """
+
+
+

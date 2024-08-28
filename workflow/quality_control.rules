@@ -1,0 +1,51 @@
+import pandas as pd
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+
+sample=samples["sample"]
+prefix=samples["prefix"]
+
+wildcard_constraints:
+    prefix = "|".join(samples.index),
+    sample = "|".join(samples["sample"])
+
+
+
+# Define a function to get the fastq files for a given prefix
+def get_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": fastqs.fq1, "r2": fastqs.fq2}
+
+
+rule end:
+    input:
+        report = final_path + "/fastqc/report_quality_control.html"
+        
+
+rule qualityControl:
+    input:
+        unpack(get_fastq)
+    output:
+        fastqc_r1 = final_path + "/fastqc/{prefix}_R1_001_fastqc.html",
+        fastqc_r2 = final_path + "/fastqc/{prefix}_R2_001_fastqc.html"
+    params:
+        outputpath = final_path + "/fastqc"
+    threads: 4
+    resources:  mem_mb=20000
+    shell:
+        "fastqc -t {threads} -o {params.outputpath} {input.r1} && "
+        "fastqc -t {threads} -o {params.outputpath} {input.r2}"
+        
+rule summaryReport:
+    input:
+        fastqc_r1 = expand(final_path + "/fastqc/{prefix}_R1_001_fastqc.html", prefix = prefix),
+        fastqc_r2 = expand(final_path + "/fastqc/{prefix}_R2_001_fastqc.html", prefix = prefix)
+    output:
+        report = final_path + "/fastqc/report_quality_control.html"
+    params:
+        path = final_path + "/fastqc"
+    shell:
+        "multiqc {params.path} --filename {output.report}"
+  

@@ -1,0 +1,54 @@
+# Please check the parameters, and adjust them according to your circumstance
+
+# Project name
+PROJECT: "Bacteriophora_exerimental_evolution"
+
+# ================== Control of the workflow ==================
+
+## Do you need to do quality control?
+QC: no  # "yes" or "no"
+
+## Do you need to do trimming?
+TRIMMING: no  # "yes" or "no"?
+
+
+GENOME:
+    "/data/users/vogi/genome/current_assembly.fasta"
+
+
+# set SCAFFOLDS as "ALL" if you want to run on all scaffolds :: impliment only if limited number of scaffolds, else split snakemake into multiple jobs :: test it
+# else give a txt file with names of scaffolds (one per line)
+SCAFFOLDS:
+    "ALL"
+
+METAFILE:
+    "configs/metadata_Vera.txt"
+
+FINALOUTPUT: /data/users/vogi
+
+tmpdir: "tmp"
+
+PLOIDY: 2
+
+# Following https://github.com/AndersenLab/wi-gatk/blob/master/main.nf for values
+HaplotypeCaller:
+  minConfidenceForVariantCalling: "20"
+  min_depth: 5
+  qual: 30.0
+  strand_odds_ratio: 5.0
+  quality_by_depth: 20.0
+  fisherstrand: 100.0
+  high_missing: 0.95
+  high_heterozygosity: 0.10
+  GQ: 15.0
+
+
+FreeBayes:
+  chunks: 50000
+  theta: 0.001 # mutation rate / expected pairwise nucleotide diversity (freebayes default 0.001)
+  max_complex_gap: -1 #  Allow haplotype calls with contiguous embedded matches of up to this length. Set N=-1 to disable clumping. (freebayes default: 3).  Read length/2 should be safe
+  use_best_n_alleles: 32 # limit number of alleles to consider; 0 for all.  @TCC for some problematic regions, otherwise runs forever
+  min_base_quality: 20 # minimum base quality for variant calling
+  min_mapping_quality: 20 # minimum mapping quality for variant calling
+
+

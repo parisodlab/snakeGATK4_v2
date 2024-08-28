@@ -1,0 +1,50 @@
+import pandas as pd
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+
+wildcard_constraints:
+    prefix = "|".join(samples.index),
+    sample = "|".join(samples["sample"])
+
+sample=samples["sample"]
+
+# Define a function to get the fastq files for a given prefix
+def get_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": fastqs.fq1, "r2": fastqs.fq2}
+
+def get_trimmed_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": os.path.join("data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join("data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
+
+
+rule end:
+    input:
+        r1 = "data/trimmed/{prefix}_R1_001.trim.fastq.gz",
+        r2 = "data/trimmed/{prefix}_R2_001.trim.fastq.gz",
+        r1_unpaired="data/trimmed/{prefix}_R1_001.unpaired.fastq.gz",
+        r2_unpaired="data/trimmed/{prefix}_R2_001.unpaired.fastq.gz"
+
+
+rule trim:
+    input:
+        unpack(get_fastq)
+    output:
+        r1 = final_path + "data/trimmed/{prefix}_R1_001.trim.fastq.gz",
+        r2 = final_path + "data/trimmed/{prefix}_R2_001.trim.fastq.gz",
+        r1_unpaired=final_path + "data/trimmed/{prefix}_R1_001.unpaired.fastq.gz",
+        r2_unpaired=final_path + "data/trimmed/{prefix}_R2_001.unpaired.fastq.gz"
+    log:
+        final_path + "logs/trimmomatic/{prefix}.log"
+    benchmark:
+        final_path + "benchmarks/trimmomatic/trimmomatic_{prefix}.json"
+    params:
+        trimmer=["LEADING:3","TRAILING:3","SLIDINGWINDOW:4:15","MINLEN:25"],
+        compression_level="-9"
+    wrapper:
+        "v3.11.0/bio/trimmomatic/pe"      
+
+
+

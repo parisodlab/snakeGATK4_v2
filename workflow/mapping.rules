@@ -1,0 +1,218 @@
+import pandas as pd
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+
+
+
+sample=samples["sample"]
+prefix=samples["prefix"]
+
+wildcard_constraints:
+    prefix = "|".join(samples.index),
+    sample = "|".join(samples["sample"])
+
+GENOME = config["GENOME"]
+
+units = pd.read_csv(config["METAFILE"],sep='\t')[["sample","prefix"]]
+dunits = units.groupby('sample').agg(lambda x: x.tolist()).to_dict('index')
+
+
+# Define a function to get the fastq files for a given prefix
+def get_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": fastqs.fq1, "r2": fastqs.fq2}
+
+def get_trimmed_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": os.path.join(final_path + "data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join(final_path + "data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
+
+
+
+def get_read_group(wildcards):
+    lane = samples.loc[(wildcards.prefix),"lane"]
+    sampleid = samples.loc[(wildcards.prefix),"sample"]
+    return {"lane":lane,"sampleid":sampleid}
+
+
+
+
+rule end:
+    input:
+        report1 = final_path + "/bamcoverage/multiqc_report.html",
+        report2 = expand(final_path + "/coverage/bamcov/{sample}_coverage.txt",sample=sample)
+
+
+
+
+rule mapping:
+    input:
+        unpack(get_fastq),
+        reference=GENOME
+    output:
+        bam=final_path + "/mapped/{prefix}.bam",
+        bai=final_path + "/mapped/{prefix}.bam.bai"
+    benchmark:
+        "benchmarks/mapping/mapping_{prefix}.txt"
+    threads:
+        12
+    params:
+        lane=lambda wildcards : get_read_group(wildcards)['lane'],
+        sampleid = lambda wildcards : get_read_group(wildcards)['sampleid'],
+        platform = "illumina",
+        outputpath = final_path + "/mapped"
+    shell:
+       """ 
+        bwa mem -t {threads} -R '@RG\\tID:{wildcards.prefix}\\tSM:{params.sampleid}' {input.reference} {input.r1} {input.r2} | \
+        sambamba view --nthreads={threads} --show-progress --sam-input --format=bam --with-header /dev/stdin | \
+        sambamba sort --nthreads={threads} --show-progress --tmpdir=tmp --out={params.outputpath}/{wildcards.prefix}.bam /dev/stdin
+        sambamba index --nthreads={threads} {params.outputpath}/{wildcards.prefix}.bam
+	
+        """
+
+rule MergeBamLanes:
+    input:
+        bamin = lambda wildcards: expand( final_path + "/mapped/{unit}.bam",unit=dunits[wildcards.sample]["prefix"])
+    output:
+        out=final_path + "/merged_samples/{sample}.bam"
+    benchmark:
+        "benchmarks/merged/{sample}.txt"
+    threads: 12
+    params:
+        inbam= lambda wildcards, input: " ".join(input.bamin)
+    shell:
+        """
+        sambamba merge --nthreads={threads} --show-progress {output.out} {params.inbam}
+        sambamba index --nthreads={threads} {output.out}
+        """
+
+rule MarkDuplicates:
+    input:
+        bam=final_path + "/merged_samples/{sample}.bam"
+    output:
+        bam=final_path + "/dedup/{sample}.bam",
+        bai=final_path + "/dedup/{sample}.bam.bai",
+        metrics=final_path + "/dedup/{sample}.duplicates.txt"
+    benchmark:
+        "benchmarks/dedup/{sample}.txt"
+    threads: 12
+    params:
+        outputpath = final_path + "/dedup"
+    shell:
+        """
+        picard -Xmx4g -Xms1g MarkDuplicates I={input.bam} O={params.outputpath}/{wildcards.sample}.bam \
+        M={params.outputpath}/{wildcards.sample}.duplicates.txt VALIDATION_STRINGENCY=SILENT \
+        REMOVE_DUPLICATES=false TAGGING_POLICY=All REMOVE_SEQUENCING_DUPLICATES=TRUE TMP_DIR={resources.tmpdir} \
+        SORTING_COLLECTION_SIZE_RATIO=0.1
+        sambamba index --nthreads={threads} {params.outputpath}/{wildcards.sample}.bam
+        """
+
+rule CoverageReport:
+    input:
+        bam=final_path + "/dedup/{sample}.bam"
+    output:
+        out=final_path + "/coverage/{sample}.txt",
+        summ=final_path + "/coverage/{sample}_summaryStats.txt",
+        bamtools=final_path + "/coverage/{sample}_bamtools_stats.txt"
+    benchmark:
+        "benchmarks/coverage/{sample}.txt"
+    threads: 12
+    params:
+        outputpath = final_path + "/coverage"
+    shell:
+        """
+        sambamba depth base -t {threads} -c 0 -F "mapping_quality > 0 and not (duplicate or failed_quality_control or unmapped or secondary_alignment)" -o  {params.outputpath}/{wildcards.sample}.txt {input.bam}
+        echo -n -e "Average read depth across genome:\t"  > {output.summ}
+        cat {params.outputpath}/{wildcards.sample}.txt | awk '{{sum+=$3}} END {{print sum/NR}}' >> {output.summ}
+        echo -n -e "% genome (breadth) covered >0x:\t" >> {output.summ}
+        cat {params.outputpath}/{wildcards.sample}.txt | awk '{{c++; if($3>0) total+=1}}END{{print (total/c)*100}}' >> {output.summ}
+        echo -n -e "% genome (breadth) covered >10x:\t" >> {output.summ}
+        cat {params.outputpath}/{wildcards.sample}.txt | awk '{{c++; if($3>10) total+=1}}END{{print (total/c)*100}}' >> {output.summ}
+        bamtools stats -in {input.bam} | grep -v "*" >  {params.outputpath}/{wildcards.sample}_bamtools_stats.txt
+        """
+
+rule genomeCov:
+    input:
+        final_path + "/dedup/{sample}.bam"
+    output:
+        final_path + "/coverage/bamcov/{sample}_coverage.txt"
+    benchmark:
+        "benchmarks/genomeCov/genomeCov_{sample}.txt"
+    params:
+        bamcov_path = "scripts/bamcov"
+    shell:
+        """
+        module add bzip2/1.0.8-GCCcore-10.3.0
+        {params.bamcov_path}/bamcov -m {input} -o {output}
+        """
+
+rule deeptoolsCov:
+    input:
+        final_path + "/dedup/{sample}.bam"
+    output:
+        final_path + "/bamcoverage/deeptools/{sample}_coverage.txt"
+    benchmark:
+        "benchmarks/deeptoolsCov/deeptoolsCov_{sample}.txt"
+    conda:
+        "../env/bamcoverage.yaml"
+    shell:
+        """
+        plotCoverage  -b {input} --outRawCounts {output} \
+        --ignoreDuplicates --minMappingQuality 10 \
+        -n 1000000000
+        """
+
+rule goleftCov:
+    input:
+        expand(final_path + "/dedup/{sample}.bam",sample=sample)
+    output:
+        ped=final_path + "/bamcoverage/goleft/report/report-indexcov.ped",
+        roc=final_path + "/bamcoverage/goleft/report/report-indexcov.roc",
+        html=directory(final_path + "/bamcoverage/goleft/report"),
+    log:
+        "indexcov.log",
+    params:
+        inbam=final_path + "/dedup/"
+    conda:
+        "../env/bamcoverage.yaml"
+    shell:
+        """
+        scripts/goleft indexcov --sex '' --directory {output.html} {params.inbam}*.bam
+        """
+
+rule samtoolsStats:
+    input:
+        final_path + "/dedup/{sample}.bam"
+    output:
+        stat=final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",
+        idxstat=final_path + "/bamcoverage/samtools/{sample}_samtools_idxstats.txt",
+        coverage=final_path + "/bamcoverage/samtools/{sample}_coverage.txt"
+    benchmark:
+        "benchmarks/samtoolsStats/samtoolsStats_{sample}.txt"
+    shell:
+        """
+        samtools stats {input} > {output.stat}
+        samtools idxstats {input} > {output.idxstat}
+        samtools coverage -H {input} > {output.coverage}
+        """
+
+rule multiqcCoverage:
+    input:
+        samtools=expand(final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",sample=sample),
+        ped=final_path + "/bamcoverage/goleft/report/report-indexcov.ped",
+        deeptools=expand(final_path + "/bamcoverage/deeptools/{sample}_coverage.txt",sample=sample),
+        stats = expand(final_path + "/coverage/{sample}_bamtools_stats.txt",sample=sample)
+    output:
+        final_path + "/bamcoverage/multiqc_report.html"
+    threads: 12
+    resources:
+        mem_mb=200000
+    params:
+        inpath1 = final_path + "/coverage",
+        inpath2 = final_path + "/bamcoverage",
+        outputpath = final_path + "/bamcoverage"
+    shell:
+        """
+        multiqc {params.inpath1} {params.inpath2} --cl-config "log_filesize_limit: 100000000000" -o {params.outputpath}
+        """

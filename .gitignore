@@ -1,0 +1,8 @@
+rep
+scaffolds.list
+sample_map.txt
+configs/*.txt
+!configs/metadata_template.txt
+data/fastq/*.gz
+tmp/
+.snakemake/
