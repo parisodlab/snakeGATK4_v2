@@ -28,20 +28,19 @@ rule qualityControl:
     input:
         unpack(get_fastq)
     output:
-        fastqc_r1 = final_path + "/fastqc/{prefix}_R1_001_fastqc.html",
-        fastqc_r2 = final_path + "/fastqc/{prefix}_R2_001_fastqc.html"
+        directory(final_path + "/fastqc/{prefix}")
     params:
-        outputpath = final_path + "/fastqc"
+        outputpath = final_path + "/fastqc/{prefix}"
     threads: 4
     resources:  mem_mb=20000
     shell:
+        "mkdir -p {params.outputpath} && "
         "fastqc -t {threads} -o {params.outputpath} {input.r1} && "
         "fastqc -t {threads} -o {params.outputpath} {input.r2}"
         
 rule summaryReport:
     input:
-        fastqc_r1 = expand(final_path + "/fastqc/{prefix}_R1_001_fastqc.html", prefix = prefix),
-        fastqc_r2 = expand(final_path + "/fastqc/{prefix}_R2_001_fastqc.html", prefix = prefix)
+        fastqc = expand(final_path + "/fastqc/{prefix}", prefix=prefix)
     output:
         report = final_path + "/fastqc/report_quality_control.html"
     params:

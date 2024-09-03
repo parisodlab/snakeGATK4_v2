@@ -6,3 +6,5 @@ configs/*.txt
 data/fastq/*.gz
 tmp/
 .snakemake/
+logs/
+benchmarks/

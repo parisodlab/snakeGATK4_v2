@@ -1,0 +1,11 @@
+name: markduplicates
+channels:
+    - conda-forge
+    - bioconda
+    - defaults
+    - R
+dependencies:
+# bioconda channel installs
+    - sambamba=1.0.1
+    - picard=3.2.0
+    

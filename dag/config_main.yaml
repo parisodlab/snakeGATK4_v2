@@ -1,7 +1,7 @@
 # Please check the parameters, and adjust them according to your circumstance
 
 # Project name
-PROJECT: "Bacteriophora_exerimental_evolution2"
+PROJECT: "snakeGATK4_v2"
 
 # ================== Control of the workflow ==================
 
@@ -13,18 +13,18 @@ TRIMMING: no  # "yes" or "no"?
 
 
 GENOME:
-    "/data/users/vogi/genome/current_assembly.fasta"
+    "/data/current_assembly.fasta"
 
 
 # set SCAFFOLDS as "ALL" if you want to run on all scaffolds :: impliment only if limited number of scaffolds, else split snakemake into multiple jobs :: test it
 # else give a txt file with names of scaffolds (one per line)
 SCAFFOLDS:
-    "ALL"
+    "scaffolds.txt"
 
 METAFILE:
-    "/data/users/vogi/metadata_Vera_020924.txt"
+    "/data/users/rchoudhury/snakeGATK4_v2/configs/metadata_template.txt"
 
-FINALOUTPUT: /data/users/vogi
+FINALOUTPUT: /data/users/rchoudhury/snakeGATK4_v2/final_output
 
 tmpdir: "tmp"
 
