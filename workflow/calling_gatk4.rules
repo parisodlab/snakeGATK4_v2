@@ -235,17 +235,47 @@ rule ConcatVCFs:
         bcftools index --tbi {output[0]}
         """
 
-rule MarkFilter:
+rule SplitVariantAndInvariant:
     input:
         final_path + "/gatk4/final_vcf/raw.vcf.gz",
         final_path + "/gatk4/final_vcf/raw.vcf.gz.tbi"
     output:
-        vcf=final_path + "/gatk4/final_vcf/mark-filter.vcf.gz",
-        index=final_path + "/gatk4/final_vcf/mark-filter.vcf.gz.tbi",
-        stats=final_path + "/gatk4/final_vcf/mark-filter.stats.txt",
-        filter_stats=final_path + "/gatk4/final_vcf/mark-filter.filter_stats.txt"
+        vcf=final_path + "/gatk4/final_vcf/variant.vcf.gz",
+        index=final_path + "/gatk4/final_vcf/variant.vcf.gz.tbi",
+        invariant=final_path + "/gatk4/final_vcf/invariant.vcf.gz",
+        invariant_index=final_path + "/gatk4/final_vcf/invariant.vcf.gz.tbi"
     benchmark:
-        "benchmarks/SoftFilter/MarkFilter.txt"
+        "benchmarks/SplitVariantAndInvariant/SplitVariantAndInvariant.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    threads:
+        20
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools filter --threads {threads} -e "MAC == 0" {input[0]} -O z > {output.vcf}
+        bcftools index --tbi {output.vcf}
+        bcftools filter --threads {threads} -i "MAC == 0" {input[0]} -O z > {output.invariant}
+        bcftools index --tbi {output.invariant}
+        """
+
+
+rule MarkFilterVariant:
+    input:
+        final_path + "/gatk4/final_vcf/variant.vcf.gz",
+        final_path + "/gatk4/final_vcf/variant.vcf.gz.tbi"
+    output:
+        vcf=final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz",
+        index=final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz.tbi",
+        stats=final_path + "/gatk4/final_vcf/mark-filter_variant.stats.txt",
+        filter_stats=final_path + "/gatk4/final_vcf/mark-filter_variant.filter_stats.txt"
+    benchmark:
+        "benchmarks/SoftFilter/MarkFilter_variant.txt"
     threads:
         4
     resources:
@@ -277,12 +307,11 @@ rule MarkFilter:
             --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
             --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
             --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
-            -O {params.outputpath}out.vcf.gz
+            -O {params.outputpath}out_variant.vcf.gz
 
-        bcftools index -f --tbi {params.outputpath}out.vcf.gz
+        bcftools index -f --tbi {params.outputpath}out_variant.vcf.gz
 
-        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' {params.outputpath}out.vcf.gz |\
-        bcftools filter --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' -O z > {output.vcf}
+        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' {params.outputpath}out_variant.vcf.gz  -O z > {output.vcf}
 
         bcftools index {output.vcf}
         bcftools index --tbi {output.vcf}
@@ -295,6 +324,93 @@ rule MarkFilter:
             bcftools query -f '%CHROM\\t%POS\\t%QUAL\\t%INFO/QD\\t%INFO/SOR\\t%INFO/FS\\t%FILTER\n' {output.vcf};
         }}     > {output.filter_stats}
         """
+
+rule MarkFilterInvariant:
+    input:
+        final_path + "/gatk4/final_vcf/invariant.vcf.gz",
+        final_path + "/gatk4/final_vcf/invariant.vcf.gz.tbi"
+    output:
+        vcf=final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz",
+        index=final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz.tbi",
+        stats=final_path + "/gatk4/final_vcf/mark-filter_invariant.stats.txt",
+        filter_stats=final_path + "/gatk4/final_vcf/mark-filter_invariant.filter_stats.txt"
+    benchmark:
+        "benchmarks/SoftFilter/MarkFilter_invariant.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 16000
+    params:
+        min_depth = config["HaplotypeCaller"]["min_depth"],
+        qual = config["HaplotypeCaller"]["qual"],
+        fisherstrand = config["HaplotypeCaller"]["fisherstrand"],
+        quality_by_depth = config["HaplotypeCaller"]["quality_by_depth"],
+        strand_odds_ratio = config["HaplotypeCaller"]["strand_odds_ratio"],
+        high_missing = config["HaplotypeCaller"]["high_missing"],
+        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"],
+        GQ = config["HaplotypeCaller"]["GQ"],
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk --java-options "-Xmx12g -Xms12g" \
+            VariantFiltration \
+            --verbosity ERROR \
+            -R {GENOME} \
+            --variant {input[0]} \
+            --genotype-filter-expression "DP < {params.min_depth}"    --genotype-filter-name "DP_min_depth" \
+            --genotype-filter-expression "GQ < {params.GQ}"        --genotype-filter-name "GQ_quality" \
+            --genotype-filter-expression "RGQ < {params.GQ}"        --genotype-filter-name "RGQ_quality" \
+            --genotype-filter-expression "isHet == 1"                  --genotype-filter-name "is_het" \
+            --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
+            --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
+            --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
+            -O {params.outputpath}out_invariant.vcf.gz
+
+        bcftools index -f --tbi {params.outputpath}out_invariant.vcf.gz
+
+        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' {params.outputpath}out_invariant.vcf.gz -O z > {output.vcf}
+
+        bcftools index {output.vcf}
+        bcftools index --tbi {output.vcf}
+
+        bcftools stats --threads {threads} \
+                    -s- --verbose {output.vcf} > {output.stats}
+
+        {{
+            echo -e 'QUAL\\tQD\\tSOR\\tFS\\tFILTER';
+            bcftools query -f '%CHROM\\t%POS\\t%QUAL\\t%INFO/QD\\t%INFO/SOR\\t%INFO/FS\\t%FILTER\n' {output.vcf};
+        }}     > {output.filter_stats}
+        """
+
+
+rule MergeVariantAndInvariant:
+    input:
+        final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz",
+        final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz",
+        final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz.tbi"
+    output:
+        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz",
+        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/MergeVariantAndInvariant/MergeVariantAndInvariant.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools concat -O z {input[0]} {input[2]} > {params.outputpath}mark-filter.vcf.gz
+        bcftools index {params.outputpath}mark-filter.vcf.gz
+        bcftools index --tbi {params.outputpath}mark-filter.vcf.gz
+        """
+            
     
 
 rule ApplyFilter:
@@ -319,9 +435,13 @@ rule ApplyFilter:
         """
         bcftools view -m2 -M2 --trim-alt-alleles -O u  {input[0]} |\
             bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "DP_min_depth"' |\
+            bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "GQ_quality"' |\
             bcftools filter -O v --exclude 'FILTER != "PASS"' |\
-            vcffixup - | \
+            vcffixup - |\
+            bcftools filter --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' |\
             bcftools view -O z --trim-alt-alleles > {params.outputpath}filtered.vcf.gz
+        
+        
 
         bcftools index {params.outputpath}filtered.vcf.gz
         bcftools index --tbi {params.outputpath}filtered.vcf.gz

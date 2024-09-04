@@ -8,3 +8,4 @@ tmp/
 .snakemake/
 logs/
 benchmarks/
+test/
