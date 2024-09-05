@@ -397,7 +397,7 @@ rule MergeVariantAndInvariant:
     benchmark:
         "benchmarks/MergeVariantAndInvariant/MergeVariantAndInvariant.txt"
     threads:
-        4
+        20
     resources:
         mem_mb = 8000
     params:
@@ -406,7 +406,7 @@ rule MergeVariantAndInvariant:
         "../env/gatk4_calling_env.yaml"
     shell:
         """
-        bcftools concat -O z {input[0]} {input[2]} > {params.outputpath}mark-filter.vcf.gz
+        bcftools concat -a --threads {threads} -O z {input[0]} {input[2]} > {params.outputpath}mark-filter.vcf.gz
         bcftools index {params.outputpath}mark-filter.vcf.gz
         bcftools index --tbi {params.outputpath}mark-filter.vcf.gz
         """
@@ -428,7 +428,8 @@ rule ApplyFilter:
     resources:
         mem_mb = 8000
     params:
-        outputpath = final_path + "/gatk4/final_vcf/"
+        outputpath = final_path + "/gatk4/final_vcf/",
+        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"]
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
@@ -436,6 +437,7 @@ rule ApplyFilter:
         bcftools view -m2 -M2 --trim-alt-alleles -O u  {input[0]} |\
             bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "DP_min_depth"' |\
             bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "GQ_quality"' |\
+            bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "RGQ_quality"' |\
             bcftools filter -O v --exclude 'FILTER != "PASS"' |\
             vcffixup - |\
             bcftools filter --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' |\
