@@ -37,11 +37,3 @@ The job can be launched using the following command:
 python main_pipeline.py
 ```
 
-## 3. Output files
-The output files are the following:
-- Mappings in BAM format
-- Mappings in GAM format
-
-
-
-source ~/.bash_profile
