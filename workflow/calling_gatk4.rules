@@ -286,8 +286,6 @@ rule MarkFilterVariant:
         fisherstrand = config["HaplotypeCaller"]["fisherstrand"],
         quality_by_depth = config["HaplotypeCaller"]["quality_by_depth"],
         strand_odds_ratio = config["HaplotypeCaller"]["strand_odds_ratio"],
-        high_missing = config["HaplotypeCaller"]["high_missing"],
-        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"],
         GQ = config["HaplotypeCaller"]["GQ"],
         outputpath = final_path + "/gatk4/final_vcf/"
     conda:
@@ -307,11 +305,7 @@ rule MarkFilterVariant:
             --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
             --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
             --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
-            -O {params.outputpath}out_variant.vcf.gz
-
-        bcftools index -f --tbi {params.outputpath}out_variant.vcf.gz
-
-        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' {params.outputpath}out_variant.vcf.gz  -O z > {output.vcf}
+            -O {output.vcf}
 
         bcftools index {output.vcf}
         bcftools index --tbi {output.vcf}
@@ -346,8 +340,6 @@ rule MarkFilterInvariant:
         fisherstrand = config["HaplotypeCaller"]["fisherstrand"],
         quality_by_depth = config["HaplotypeCaller"]["quality_by_depth"],
         strand_odds_ratio = config["HaplotypeCaller"]["strand_odds_ratio"],
-        high_missing = config["HaplotypeCaller"]["high_missing"],
-        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"],
         GQ = config["HaplotypeCaller"]["GQ"],
         outputpath = final_path + "/gatk4/final_vcf/"
     conda:
@@ -366,14 +358,11 @@ rule MarkFilterInvariant:
             --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
             --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
             --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
-            -O {params.outputpath}out_invariant.vcf.gz
-
-        bcftools index -f --tbi {params.outputpath}out_invariant.vcf.gz
-
-        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' {params.outputpath}out_invariant.vcf.gz -O z > {output.vcf}
+            -O {output.vcf}
 
         bcftools index {output.vcf}
         bcftools index --tbi {output.vcf}
+
 
         bcftools stats --threads {threads} \
                     -s- --verbose {output.vcf} > {output.stats}
@@ -384,45 +373,15 @@ rule MarkFilterInvariant:
         }}     > {output.filter_stats}
         """
 
-
-rule MergeVariantAndInvariant:
+rule ApplyFilter_variants:
     input:
         final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz",
-        final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz.tbi",
-        final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz",
-        final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz.tbi"
+        final_path + "/gatk4/final_vcf/mark-filter_variant.vcf.gz.tbi"
     output:
-        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz",
-        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz.tbi"
+        final_path + "/gatk4/final_vcf/filtered_variant.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered_variant.vcf.gz.tbi"
     benchmark:
-        "benchmarks/MergeVariantAndInvariant/MergeVariantAndInvariant.txt"
-    threads:
-        20
-    resources:
-        mem_mb = 8000
-    params:
-        outputpath = final_path + "/gatk4/final_vcf/"
-    conda:
-        "../env/gatk4_calling_env.yaml"
-    shell:
-        """
-        bcftools concat -a --threads {threads} -O z {input[0]} {input[2]} > {params.outputpath}mark-filter.vcf.gz
-        bcftools index {params.outputpath}mark-filter.vcf.gz
-        bcftools index --tbi {params.outputpath}mark-filter.vcf.gz
-        """
-            
-    
-
-rule ApplyFilter:
-    input:
-        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz",
-        final_path + "/gatk4/final_vcf/mark-filter.vcf.gz.tbi"
-    output:
-        final_path + "/gatk4/final_vcf/filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi",
-        final_path + "/gatk4/final_vcf/filtered.stats.txt"
-    benchmark:
-        "benchmarks/ApplyFilter/ApplyFilter.txt"
+        "benchmarks/ApplyFilter/ApplyFilter_variants.txt"
     threads:
         4
     resources:
@@ -437,20 +396,77 @@ rule ApplyFilter:
         bcftools view -m2 -M2 --trim-alt-alleles -O u  {input[0]} |\
             bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "DP_min_depth"' |\
             bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "GQ_quality"' |\
-            bcftools filter -O u --set-GTs . --exclude 'FORMAT/FT ~ "RGQ_quality"' |\
             bcftools filter -O v --exclude 'FILTER != "PASS"' |\
             vcffixup - |\
-            bcftools filter --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' |\
-            bcftools view -O z --trim-alt-alleles > {params.outputpath}filtered.vcf.gz
+            bcftools view -O z --trim-alt-alleles > {output[0]}
         
+        bcftools index {output[0]}
+        bcftools index --tbi {output[0]}
         
-
-        bcftools index {params.outputpath}filtered.vcf.gz
-        bcftools index --tbi {params.outputpath}filtered.vcf.gz
-        bcftools stats -s- --verbose {params.outputpath}filtered.vcf.gz > {params.outputpath}filtered.stats.txt
         """
 
+rule ApplyFilter_invariants:
+    input:
+        final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz",
+        final_path + "/gatk4/final_vcf/mark-filter_invariant.vcf.gz.tbi"
+    output:
+        final_path + "/gatk4/final_vcf/filtered_invariant.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered_invariant.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/ApplyFilter/ApplyFilter_invariants.txt"
+    threads:
+        20
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+            bcftools filter --threads {threads} -O u --set-GTs . --exclude 'FORMAT/FT ~ "DP_min_depth"' {input[0]} |\
+            bcftools filter --threads {threads} -O u --set-GTs . --exclude 'FORMAT/FT ~ "RGQ_quality"' |\
+            bcftools filter --threads {threads} -O v --exclude 'FILTER != "PASS"' |\
+            vcffixup - |\
+            bcftools view --threads {threads} -O z --trim-alt-alleles > {output[0]}
 
+        bcftools index {output[0]}
+        bcftools index --tbi {output[0]}
+        """
+
+rule MergeVariantAndInvariant:
+    input:
+        final_path + "/gatk4/final_vcf/filtered_variant.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered_variant.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/filtered_invariant.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered_invariant.vcf.gz.tbi"
+    output:
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/filtered.stats.txt"
+    benchmark:
+        "benchmarks/MergeVariantAndInvariant/MergeVariantAndInvariant.txt"
+    threads:
+        20
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/",
+        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"],
+        high_missing = config["HaplotypeCaller"]["high_missing"]
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools concat -a --threads {threads} -O u {input[0]} {input[2]} |\
+        bcftools filter -O u --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' |\
+        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' -O z > {output[0]}
+        bcftools index {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats --threads {threads} -s- --verbose {output[0]} > {output[2]}
+        """
+            
+  
 rule FilterVCFminAF:
     input:
         final_path + "/gatk4/final_vcf/filtered.vcf.gz",
@@ -470,11 +486,11 @@ rule FilterVCFminAF:
         "../env/gatk4_calling_env.yaml"
     shell:
         """
-        bcftools view -O v --min-af 0.000001 --max-af 0.999999 {input[0]} |\
+        bcftools view --threads {threads} -O v --min-af 0.000001 --max-af 0.999999 {input[0]} |\
             vcffixup - | \
-            bcftools view -O z > {params.outputpath}af_filtered.vcf.gz
+            bcftools view --threads {threads} -O z > {params.outputpath}af_filtered.vcf.gz
         bcftools index {params.outputpath}af_filtered.vcf.gz
-        bcftools stats -s- --verbose {params.outputpath}af_filtered.vcf.gz > {params.outputpath}af_filtered.stats.txt
+        bcftools stats --threads {threads} -s- --verbose {params.outputpath}af_filtered.vcf.gz > {params.outputpath}af_filtered.stats.txt
         """
 
 rule MultiQC:
