@@ -1,0 +1,24 @@
+DATATYPE 0
+INDFILE data.indfile
+OUTFILE data.outfile
+MISCFILE data.miscfile
+K 4
+C 64
+R 10
+M 3
+W 0
+S 2
+GREEDY_OPTION 2
+REPEATS 100000
+PERMUTATIONFILE data.permutationfile
+PRINT_PERMUTED_DATA 1
+PERMUTED_DATAFILE data.perm_datafile
+PRINT_EVERY_PERM 0
+EVERY_PERMFILE data.every_permfile
+PRINT_RANDOM_INPUTORDER 0
+RANDOM_INPUTORDERFILE data.ran_inputorderfile
+OVERRIDE_WARNINGS 0
+ORDER_BY_RUN 1
+
+# --------------- CLUMPP parameters --------------------------------------------
+
