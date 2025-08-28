@@ -10,3 +10,4 @@ dependencies:
     - bcftools=1.20
     - vcflib=1.0.3
     - multiqc
+    - r-base

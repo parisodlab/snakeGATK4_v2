@@ -1,0 +1,8 @@
+name: structure_env
+channels:
+    - conda-forge
+    - bioconda
+    - defaults
+    - R
+dependencies:
+    - structureharvester=0.6.94

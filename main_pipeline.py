@@ -38,40 +38,43 @@ def spend_time(start_time, end_time):
     return "%d:%02d:%02d" % (hours, minutes, seconds)
 
 
-if qc:
-    print("Start QC!")
-    start_time = time.time()
-    os.system(
-        "snakemake --rerun-triggers mtime -s workflow/quality_control.rules --profile slurm 2>&1 | tee logs/log_quality_control.txt"
-    )
-    end_time = time.time()
-    file_log_time.write(
-        "Time of running QC: " + spend_time(start_time, end_time) + "\n"
-    )
-    print(
-        "Quality control is done!\n Please check the report and decide whether trimming is needed\n Please remember to turn off the QC in the config file!"
-    )
-    os._exit(0)
-else:
-    if trim:
-        print("Start Trimming!")
-        start_time = time.time()
-        os.system(
-            "snakemake -s workflow/trim.rules --profile slurm 2>&1 | tee logs/log_trim.txt"
-        )
-        end_time = time.time()
-        file_log_time.write(
-            "Time of running trimming:" + spend_time(start_time, end_time) + "\n"
-        )
-        print("Trimming is done!")
-    else:
-        print("Trimming is not required")
+# if qc:
+#     print("Start QC!")
+#     start_time = time.time()
+#     os.system(
+#         "snakemake --rerun-triggers mtime -s workflow/quality_control.rules --profile slurm 2>&1 | tee logs/log_quality_control.txt"
+#     )
+#     end_time = time.time()
+#     file_log_time.write(
+#         "Time of running QC: " + spend_time(start_time, end_time) + "\n"
+#     )
+#     print(
+#         "Quality control is done!\n Please check the report and decide whether trimming is needed\n Please remember to turn off the QC in the config file!"
+#     )
+#     os._exit(0)
+# else:
+#     if trim:
+#         print("Start Trimming!")
+#         start_time = time.time()
+#         os.system(
+#             "snakemake -s workflow/trim.rules --profile slurm 2>&1 | tee logs/log_trim.txt"
+#         )
+#         end_time = time.time()
+#         file_log_time.write(
+#             "Time of running trimming:" + spend_time(start_time, end_time) + "\n"
+#         )
+#         print("Trimming is done!")
+
+#     else:
+#         print("Trimming is not required")
 
 
 print("Mapping is starting!")
+# change to temp_path
+
 start_time = time.time()
 os.system(
-    "snakemake --rerun-triggers mtime -s workflow/mapping.rules --profile slurm 2>&1 | tee logs/log_map.txt"
+    "snakemake -p --rerun-triggers mtime -s workflow/mapping.rules --profile slurm 2>&1 | tee logs/log_map.txt"
 )
 end_time = time.time()
 file_log_time.write(
@@ -82,7 +85,8 @@ print("Mapping is done!")
 print("Variant calling using GATK4 is starting!")
 start_time = time.time()
 os.system(
-    "snakemake --rerun-triggers mtime -s workflow/calling_gatk4.rules --profile slurm 2>&1 | tee logs/log_calling_gatk4.txt"
+    "snakemake -np --rerun-triggers mtime -s workflow/calling_gatk4.rules --profile slurm 2>&1 | tee logs/log_calling_gatk4.txt"
+    #  "snakemake --rerun-triggers mtime -s workflow/calling_gatk4.rules --profile slurm 2>&1 | tee logs/log_calling_gatk4.txt"
 )
 end_time = time.time()
 file_log_time.write(

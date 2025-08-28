@@ -1,0 +1,23 @@
+name: structure_env
+channels:
+    - conda-forge
+    - bioconda
+    - defaults
+    - R
+dependencies:
+    - structure=2.3.4
+    - r-base=4.3.2
+    - r-tidyverse=2.0.0
+    - r-data.table=1.17.6
+    - pgdspider=2.1.1.5
+    - python=3.10
+    - ipyrad::clumpp=1.1.2
+    - plink=1.90b7.7
+    - pip=23.1.2
+    - pip:
+        - matplotlib==3.7.1
+        - pandas==2.0.3
+        - numpy==1.25.2
+
+
+    

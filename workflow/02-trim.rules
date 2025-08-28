@@ -1,0 +1,66 @@
+import pandas as pd
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+input_path = config["INPUT"]
+
+wildcard_constraints:
+    prefix = "|".join(samples.index),
+    sample = "|".join(samples["sample"])
+
+sample=samples["sample"]
+prefix=samples["prefix"]
+
+# Define a function to get the fastq files for a given prefix
+def get_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": fastqs.fq1, "r2": fastqs.fq2}
+
+def get_trimmed_fastq(wildcards):
+    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
+    return {"r1": os.path.join("data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join("data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
+
+
+rule end:
+    input:
+        r1 = expand(final_path + "/data/trimmed/{prefix}_R1_001.trim.fastq.gz", prefix=prefix),
+        r2 = expand(final_path + "/data/trimmed/{prefix}_R2_001.trim.fastq.gz", prefix=prefix),
+        report_html = expand(final_path + "/fastp/{prefix}.html", prefix=prefix),
+        report_json = expand(final_path + "/fastp/{prefix}.json", prefix=prefix)
+
+
+
+rule trim:
+    input:
+        unpack(get_fastq)
+    output:
+        r1 = final_path + "/data/trimmed/{prefix}_R1_001.trim.fastq.gz",
+        r2 = final_path + "/data/trimmed/{prefix}_R2_001.trim.fastq.gz",
+        report_html = final_path + "/fastp/{prefix}.html",
+        report_json = final_path + "/fastp/{prefix}.json"
+    benchmark:
+        final_path + "benchmarks/fastp/fastp_{prefix}.json"
+    params:
+        compression_level="-9",
+        minlen=25,  # Equivalent to MINLEN:25 in Trimmomatic
+        sliding_window="4:15"  # Equivalent to SLIDINGWINDOW:4:15
+    threads: 8
+    shell:
+        """
+        fastp -i {input.r1} -I {input.r2} \
+              -o {output.r1} -O {output.r2} \
+              --trim_poly_g \
+              --detect_adapter_for_pe \
+              --cut_front --cut_tail \
+              --cut_window_size 4 \
+              --cut_mean_quality 15 \
+              --qualified_quality_phred 15 \
+              --length_required {params.minlen} \
+              --thread 8 \
+              --html {output.report_html} --json {output.report_json} 
+
+        """
+
+
+

@@ -1,0 +1,18 @@
+name: adegenet_env
+channels:
+  - conda-forge
+  - bioconda
+  - r
+  - defaults
+dependencies:
+  - r-base=4.1.3
+  - r-adegenet=2.1.8
+  - r-pegas
+  - r-vcfr
+  - r-tidyverse
+  - r-cowplot
+  - r-ggrepel
+  - r-viridis
+  - bioconductor-snprelate
+
+

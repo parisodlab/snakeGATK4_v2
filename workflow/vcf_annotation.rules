@@ -1,0 +1,31 @@
+import pandas as pd
+import os
+configfile: "config_main.yaml"
+
+final_vcf = config["final_vcf"]
+GENOME = config["GENOME"]
+GENOME_GFF= config["GENOME_GFF"]
+final_path=config["FINALOUTPUT"] + "/" + config["PROJECT"]
+
+rule degeneracy_annotation:
+    input:
+        vcf=final_vcf,
+        reference=GENOME,
+        gff=GENOME_GFF,
+        degenerate_sites=final_path + "/degeneracy/degeneracy_sites.txt"
+    output:
+        final_path + "degeneracy/annotated_degeneracy.vcf"
+    benchmark:
+        "benchmarks/vcf_annotation/degeneracy.txt"
+    threads:
+        4
+    params:
+        outputpath=final_path + "/degeneracy/"
+    resources:
+        mem_mb = 8000,
+        time = "3-0"
+    conda: "../env/vcf_annotation.yaml"
+    shell:
+        """
+        degenotate.py -a {input.gff} -g {input.reference} -o {params.outputpath} -v {input.vcf} -d {input.degenerate_sites} --threads {threads}
+        """

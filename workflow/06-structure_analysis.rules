@@ -1,0 +1,611 @@
+import glob
+import os
+import yaml
+import pandas as pd
+
+# Load config
+configfile: "config_main.yaml"
+
+
+final_path = config["FINALOUTPUT"] + config["PROJECT"]
+logs_path = config["log_folder"]
+
+
+rule all:
+    input:
+        final_path + "/pca/pca_" + config["PCA"]["ploidy"] + ".pdf",
+        os.path.join(final_path, "structure", "harvester_output", "evanno.txt"),
+        os.path.join(final_path, "structure", "harvester_output", "bestK.txt"),
+        os.path.join(final_path, "structure", "clumpp", "clumpp_done.txt")
+
+
+
+# Set parameters for Structure analysis
+
+MODE   = config["Structure"]["run_mode"]
+KS     = config["Structure"]["ks"]
+REPS   = config["Structure"]["replicates"]
+BURNIN = config["Structure"]["burnin"]
+MCMC   = config["Structure"]["mcmc"]
+
+
+
+rule Filter_missingness:
+    input:
+        vcf=final_path + "/gatk4/final_vcf/filtered.vcf.gz",
+        tbi=final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi"
+    output:
+        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/missingness_filtered.stats.txt",
+        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz.tbi"
+    benchmark:
+        "benchmarks/FilterVCFminAF_and_missingness/Filter_missingness.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view --threads {threads} -O v -i 'F_MISSING <= 0.5'  {input[0]} |\
+            vcffixup - | \
+            bcftools view --threads {threads} -O z > {params.outputpath}missingness_filtered.vcf.gz
+        bcftools index {params.outputpath}missingness_filtered.vcf.gz
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}missingness_filtered.vcf.gz > {params.outputpath}missingness_filtered.stats.txt
+        """
+
+
+rule FilterVCFminAF:
+    input:
+        vcf=final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz",
+        tbi=final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz.tbi"
+    output:
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/af_filtered.stats.txt"
+    benchmark:
+        "benchmarks/FilterVCFminAF_and_missingness/FilterVCFminAF.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view --threads {threads} -O v --min-af 0.03 --max-af 0.97 {input[0]} |\
+            vcffixup - | \
+            bcftools view --threads {threads} -O z > {params.outputpath}af_filtered.vcf.gz
+        bcftools index {params.outputpath}af_filtered.vcf.gz
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}af_filtered.vcf.gz > {params.outputpath}af_filtered.stats.txt
+        """
+
+
+rule MultiQC:
+    input:
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"
+    output:
+        final_path + "/gatk4/final_vcf/multiqc_report.html"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    shell:
+        """
+        multiqc {params.outputpath} -o {params.outputpath}
+        """
+
+        
+rule count_vcf_stats:
+    input:
+        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz")
+    output:
+        inds=final_path + "/structure/num_inds.txt",
+        loci=final_path + "/structure/num_loci.txt"
+    run:
+        import gzip
+
+        def open_vcf(path):
+            return gzip.open(path, "rt") if path.endswith(".gz") else open(path)
+
+        with open_vcf(input.vcf) as vcf:
+            for line in vcf:
+                if line.startswith("#CHROM"):
+                    samples = line.strip().split("\t")[9:]
+                    num_inds = len(samples)
+                    break
+
+        with open_vcf(input.vcf) as vcf:
+            num_loci = sum(1 for line in vcf if not line.startswith("#"))
+
+        with open(output.inds, "w") as f:
+            f.write(str(num_inds))
+        with open(output.loci, "w") as f:
+            f.write(str(num_loci))
+
+
+rule convert_vcf_to_structure:
+    input:
+        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz")
+    output:
+        structure=final_path + "/structure/structure.str"
+    conda:
+        "../env/structure_env.yaml"
+    params:
+        outputpath = final_path + "structure"
+    shell:
+        """
+        python scripts/VCF_to_STRUCTURE.py -v {input.vcf} \
+            -o {output.structure}
+        """
+
+rule generate_structure_params:
+    input:
+        inds=final_path + "/structure/num_inds.txt",
+        loci=final_path + "/structure/num_loci.txt",
+        structure=final_path + "/structure/structure.str"
+    output:
+        mainparams=final_path + "/structure/params/mainparams",
+        extraparams=final_path + "/structure/params/extraparams"
+    params:
+        outfile="output_file.structure_res",
+        maxpops=2,
+        burnin=BURNIN,
+        numreps=MCMC
+    run:
+        # Read number of individuals and loci
+        with open(input.inds) as f:
+            numinds = f.read().strip()
+        with open(input.loci) as f:
+            numloci = f.read().strip()
+
+        # Define mainparams content
+        mainparams_content = f"""\
+#define OUTFILE {params.outfile}
+#define INFILE {input.structure}
+#define NUMINDS {numinds}
+#define NUMLOCI {numloci}
+#define MAXPOPS {params.maxpops}
+#define BURNIN {params.burnin}
+#define NUMREPS {params.numreps}
+#define PLOIDY {config["Structure"]["ploidy"]}
+"""
+
+        mainparams_content += """\
+#define LABEL 1
+#define POPDATA 0
+#define POPFLAG 0
+#define LOCDATA 0
+#define PHENOTYPE 0
+#define MARKERNAMES 0
+#define MAPDISTANCES 0
+#define ONEROWPERIND 0
+#define PHASEINFO 0
+#define PHASED 0
+#define RECESSIVEALLELES 0
+#define EXTRACOLS 0
+#define MISSING -9
+"""
+
+        # Define extraparams content
+        extraparams_content = """\
+#define NOADMIX 0
+#define LINKAGE 0
+#define USEPOPINFO 0
+#define GENSBACK 2
+
+#define LOCPRIOR 0
+#define LOCPRIORINIT 1.0
+#define MAXLOCPRIOR 100.0
+
+#define INFERALPHA 1
+#define ALPHA 1.0
+#define POPALPHAS 0
+#define UNIFPRIORALPHA 1
+#define ALPHAMAX 10.0
+#define ALPHAPROPSD 0.025
+
+#define FREQSCORR 1
+#define ONEFST 0
+#define FPRIORMEAN 0.01
+#define FPRIORSD 0.05
+
+#define INFERLAMBDA 0
+#define LAMBDA 1.0
+#define COMPUTEPROB 1
+#define PFROMPOPFLAGONLY 0
+#define ANCESTDIST 0
+#define STARTATPOPINFO 0
+#define METROFREQ 10
+
+#define UPDATEFREQ 5000
+#define RANDOMIZE 0
+
+"""
+
+        # Write to files
+        with open(output.mainparams, "w") as f:
+            f.write(mainparams_content)
+
+        with open(output.extraparams, "w") as f:
+            f.write(extraparams_content)
+
+
+
+rule run_structure:
+    input:
+        structure=final_path + "/structure/structure.str",
+        inds=final_path + "/structure/num_inds.txt",
+        loci=final_path + "/structure/num_loci.txt",
+        mainparams=final_path + "/structure/params/mainparams",
+        extraparams=final_path + "/structure/params/extraparams"
+    output:
+        final_path + "/structure/results/K{K}_rep{r}_f"
+    conda:
+        "../env/structure_env.yaml"
+    resources:
+        time= config["Structure"]["time"]  # Use time from config
+    params:
+        outdir=lambda wc: f"{final_path}/structure/results",
+        outfile=lambda wc: f"K{wc.K}_rep{wc.r}",
+        seed=lambda wc: str(abs(hash(f'{wc.K}_{wc.r}')) % 10**6)
+    shell:
+        """
+        N=$(cat {input.inds}); L=$(cat {input.loci})
+        mkdir -p {params.outdir}
+        structure -K {wildcards.K} -N $N -L $L \
+                    -m {input.mainparams} -e {input.extraparams} \
+                    -i {input.structure} -o {params.outdir}/{params.outfile} \
+                    -D {params.seed} -B {BURNIN} -M {MCMC} \
+                    > {params.outdir}/{params.outfile}.log
+        """
+
+
+
+
+rule structure_harvester:
+    input:
+        expand(final_path + "/structure/results/K{K}_rep{r}_f",
+            K=KS, r=range(1, REPS+1))
+    output:
+        evanno = f"{final_path}/structure/harvester_output/evanno.txt",
+        bestK  = f"{final_path}/structure/harvester_output/bestK.txt",
+        indfiles = expand(f"{final_path}/structure/harvester_output/K{{K}}.indfile", K=KS)
+    conda:
+        "../env/structureharvester_env.yaml"
+    params:
+        outdir    = final_path + "/structure/harvester_output",
+        indir     = final_path + "/structure/results"
+    shell:
+        """
+        mkdir -p {params.outdir}
+        structureHarvester.py --dir={params.indir} --out={params.outdir} --evanno --clumpp
+
+        # parse best K from evanno.txt: column 1 = K, column 4 = Delta K
+        awk 'NR>1 {{if($4>max){{max=$4;best=$1}}}} END {{print best}}' {output.evanno} > {output.bestK}
+        """
+
+rule clumpp:
+        input:
+            structure=final_path + "/structure/structure.str",
+            indfile = expand(f"{final_path}/structure/harvester_output/K{{K}}.indfile", K=KS),
+            inds=final_path + "/structure/num_inds.txt"
+        output:
+            touch(final_path + "/structure/clumpp/clumpp_done.txt")
+        params:
+            outdir = final_path + "/structure/clumpp/",
+            harvester_output = final_path + "/structure/harvester_output",
+            params_clumpp = "data/structure/clumpp_params/paramfile"
+        conda:
+            "../env/structure_env.yaml"
+        shell:
+            r"""
+            basedir=$PWD
+            mkdir -p {params.outdir}
+            inds=$(cat {input.inds})
+            cp {params.params_clumpp} {params.outdir}/.
+            cd {params.outdir}
+            
+
+            if [ "{MODE}" = "bestK" ]; then
+                K=$(cat $basedir/{params.harvester_output}/bestK.txt)
+                cp $basedir/{params.harvester_output}/K$K.indfile .
+                echo "Running CLUMPP at best K = $K"
+                outfile=$basedir/{params.outdir}/clumpp_output_$K.txt
+                CLUMPP -k $K -r {REPS} -c $inds \
+                    -i K$K.indfile \
+                    -o $outfile -j $basedir/{params.outdir}/K$K.MISCFILE
+            else
+                K={KS}
+                echo "Running CLUMPP at fixed K = $K"
+                outfile=$basedir/{params.outdir}/clumpp_output_$K.txt
+                CLUMPP -k $K -r {REPS} -c $inds \
+                    -i K$K.indfile \
+                    -o $outfile -j $basedir/{params.outdir}/K$K.MISCFILE
+            fi
+            python $basedir/scripts/plot_clumpp.py \
+                $outfile $basedir/{input.structure} $outfile.pdf $K
+            """
+        
+
+rule glpca_diploid:
+    input:
+        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
+        metadata=config["METAFILE"]
+    output:
+        pdf="results/pca/pca_diploid.pdf"
+    conda:
+        "../env/pca.yaml"
+    shell:
+        """
+        Rscript -e '
+        library(adegenet)
+        library(vcfR)
+        library(tidyverse)
+        library(cowplot)
+        library(scales)
+        library(ggrepel)  # for nice sample labels
+
+        # Read VCF and convert to genlight
+        vcf <- read.vcfR("{input.vcf}")
+        genlight_obj <- vcfR2genlight(vcf)
+
+        # Read metadata
+        metadata <- read.table("{input.metadata}", header = TRUE, stringsAsFactors = FALSE)
+        metadata <- metadata %>%
+            select(sample, pop) %>%
+            distinct() %>%
+            rename(Population = pop)
+
+        # PCA
+        pca_res <- glPca(genlight_obj, nf = 3)
+
+        # Create data frame with PCA scores and sample IDs
+        pca_df <- as.data.frame(pca_res$scores)
+        colnames(pca_df) <- paste0("PC", 1:3)
+        pca_df$sample <- rownames(pca_df)
+
+        # Join metadata for populations
+        pca_df <- left_join(pca_df, metadata, by = "sample")
+        pca_df$Population <- as.factor(pca_df$Population)
+
+        # Use a colorblind-friendly palette (viridis)
+        library(viridis)
+        pop_colors <- viridis::viridis(length(levels(pca_df$Population)))
+
+        # Base theme for cleaner look
+        base_theme <- theme_classic(base_size = 14) +
+            theme(
+                legend.position = "right",
+                legend.title = element_text(size=12),
+                legend.text = element_text(size=10),
+                axis.title = element_text(size=12),
+                axis.text = element_text(size=10)
+            )
+
+        # PC1 vs PC2 plot with sample labels
+        p1 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Population)) +
+            geom_point(size = 3, alpha = 0.9) +
+            geom_text_repel(aes(label = sample), size = 3, max.overlaps = 15) +
+            scale_color_manual(values = pop_colors) +
+            labs(title = "PCA: PC1 vs PC2", color = "Population") +
+            base_theme
+
+        # PC1 vs PC3 plot with sample labels
+        p2 <- ggplot(pca_df, aes(x = PC1, y = PC3, color = Population)) +
+            geom_point(size = 3, alpha = 0.9) +
+            geom_text_repel(aes(label = sample), size = 3, max.overlaps = 15) +
+            scale_color_manual(values = pop_colors) +
+            labs(title = "PCA: PC1 vs PC3", color = "Population") +
+            base_theme
+
+        # Extract legend from one plot and remove legends from individual plots
+        legend <- get_legend(p1 + theme(legend.position = "bottom", legend.direction = "horizontal"))
+        p1 <- p1 + theme(legend.position = "none")
+        p2 <- p2 + theme(legend.position = "none")
+
+        # Arrange plots side by side, legend below
+        combined <- plot_grid(p1, p2, ncol = 2, align = "hv", labels = c("A", "B"))
+        final_plot <- plot_grid(combined, legend, ncol = 1, rel_heights = c(1, 0.1))
+
+        # Save plot at high resolution
+        ggsave(filename = "{output.pdf}", plot = final_plot, width = 12, height = 6, dpi = 600)
+        '
+        """
+
+
+rule glpca_tetraploid:
+    input:
+        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
+        metadata=config["METAFILE"]
+    output:
+        pdf="results/pca/pca_tetraploid.pdf"
+    conda:
+        "../env/pca.yaml"
+    shell:
+        """
+        Rscript -e '
+        library(adegenet)
+        library(vcfR)
+        library(tidyverse)
+        library(cowplot)
+        library(scales)
+        library(ggrepel)  # for nice sample labels
+        
+
+        source("scripts/vcfR2genlight.tetra.R")  # Custom function for tetraploid conversion
+
+        # Read VCF file
+        vcf <- read.vcfR("{input.vcf}")
+
+        # Read metadata
+        metadata <- read.table("{input.metadata}", header = TRUE, stringsAsFactors = FALSE)
+        metadata <- metadata %>%
+            select(sample, pop) %>%
+            distinct() %>%
+            rename(Population = pop)
+
+        # Convert using custom tetraploid function
+        genlight_obj <- vcfR2genlight.tetra(vcf)
+
+        # PCA
+        pca_res <- glPca(genlight_obj, nf = 3)
+
+        # Create data frame with PCA scores and sample IDs
+        pca_df <- as.data.frame(pca_res$scores)
+        colnames(pca_df) <- paste0("PC", 1:3)
+        pca_df$sample <- rownames(pca_df)
+
+        # Join metadata for populations
+        pca_df <- left_join(pca_df, metadata, by = "sample")
+        pca_df$Population <- as.factor(pca_df$Population)
+
+        # Use a colorblind-friendly palette (viridis)
+        library(viridis)
+        pop_colors <- viridis::viridis(length(levels(pca_df$Population)))
+
+        # Base theme for cleaner look
+        base_theme <- theme_classic(base_size = 14) +
+            theme(
+                legend.position = "right",
+                legend.title = element_text(size=12),
+                legend.text = element_text(size=10),
+                axis.title = element_text(size=12),
+                axis.text = element_text(size=10)
+            )
+
+        # PC1 vs PC2 plot with sample labels
+        p1 <- ggplot(pca_df, aes(x = PC1, y = PC2, color = Population)) +
+            geom_point(size = 3, alpha = 0.9) +
+            geom_text_repel(aes(label = sample), size = 3, max.overlaps = 15) +
+            scale_color_manual(values = pop_colors) +
+            labs(title = "PCA: PC1 vs PC2", color = "Population") +
+            base_theme
+
+        # PC1 vs PC3 plot with sample labels
+        p2 <- ggplot(pca_df, aes(x = PC1, y = PC3, color = Population)) +
+            geom_point(size = 3, alpha = 0.9) +
+            geom_text_repel(aes(label = sample), size = 3, max.overlaps = 15) +
+            scale_color_manual(values = pop_colors) +
+            labs(title = "PCA: PC1 vs PC3", color = "Population") +
+            base_theme
+
+        # Extract legend from one plot and remove legends from individual plots
+        legend <- get_legend(p1 + theme(legend.position = "bottom", legend.direction = "horizontal"))
+        p1 <- p1 + theme(legend.position = "none")
+        p2 <- p2 + theme(legend.position = "none")
+
+        # Arrange plots side by side, legend below
+        combined <- plot_grid(p1, p2, ncol = 2, align = "hv", labels = c("A", "B"))
+        final_plot <- plot_grid(combined, legend, ncol = 1, rel_heights = c(1, 0.1))
+
+        # Save plot at high resolution
+        ggsave(filename = "{output.pdf}", plot = final_plot, width = 12, height = 6, dpi = 600)
+        '
+        """
+
+rule mixedploidy_pca:
+    input:
+        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
+        metadata=config["METAFILE"]
+    output:
+        pdf=final_path + "/pca/pca_" + config["PCA"]["ploidy"] + ".pdf"
+    conda:
+        "../env/pca.yaml"   # same environment as diploid PCA, with ggplot2, viridis, ggrepel, cowplot etc.
+    shell:
+        """
+        Rscript -e '
+        library(SNPRelate)
+        library(tidyverse)
+        library(viridis)
+        library(cowplot)
+        library(ggrepel)
+        library(scales)
+
+        # Convert VCF to GDS and open
+        vcf.fn <- "{input.vcf}"
+        gds.fn <- tempfile(fileext = ".gds")
+        snpgdsVCF2GDS(vcf.fn, gds.fn, method="biallelic.only", verbose=FALSE)
+        genofile <- snpgdsOpen(gds.fn)
+
+        # Run PCA on all chromosomes (including non-autosomes)
+        pca <- snpgdsPCA(genofile, autosome.only=FALSE, verbose=FALSE)
+
+        # Get variance explained per PC
+        var <- pca$varprop * 100
+
+        # Create data.frame for plotting
+        pca_df <- data.frame(
+            sample = pca$sample.id,
+            PC1 = pca$eigenvect[,1],
+            PC2 = pca$eigenvect[,2],
+            PC3 = pca$eigenvect[,3]
+        )
+
+        # Read metadata and merge
+        metadata <- read.table("{input.metadata}", header=TRUE, stringsAsFactors=FALSE) %>%
+            select(sample, pop) %>%
+            distinct() %>%
+            rename(Population = pop)
+
+        pca_df <- left_join(pca_df, metadata, by = "sample")
+        pca_df$Population <- as.factor(pca_df$Population)
+
+        # Color palette: viridis
+        pop_colors <- viridis(length(levels(pca_df$Population)))
+
+        # Base theme
+        base_theme <- theme_classic(base_size=14) +
+            theme(
+                legend.position = "right",
+                legend.title = element_text(size=12),
+                legend.text = element_text(size=10),
+                axis.title = element_text(size=12),
+                axis.text = element_text(size=10)
+            )
+
+        # PC1 vs PC2 with sample labels
+        p1 <- ggplot(pca_df, aes(x=PC1, y=PC2, color=Population)) +
+            geom_point(size=3, alpha=0.9) +
+            geom_text_repel(aes(label=sample), size=3, max.overlaps=15) +
+            scale_color_manual(values=pop_colors) +
+            labs(
+                title = paste0("PCA: PC1 vs PC2"),
+                x = paste0("PC1 (", round(var[1],2), "%)"),
+                y = paste0("PC2 (", round(var[2],2), "%)"),
+                color = "Population"
+            ) +
+            base_theme
+
+        # PC1 vs PC3 with sample labels
+        p2 <- ggplot(pca_df, aes(x=PC1, y=PC3, color=Population)) +
+            geom_point(size=3, alpha=0.9) +
+            geom_text_repel(aes(label=sample), size=3, max.overlaps=15) +
+            scale_color_manual(values=pop_colors) +
+            labs(
+                title = paste0("PCA: PC1 vs PC3"),
+                x = paste0("PC1 (", round(var[1],2), "%)"),
+                y = paste0("PC3 (", round(var[3],2), "%)"),
+                color = "Population"
+            ) +
+            base_theme
+
+        # Legend extraction and final assembly
+        legend <- get_legend(p1 + theme(legend.position = "bottom", legend.direction = "horizontal"))
+        p1 <- p1 + theme(legend.position = "none")
+        p2 <- p2 + theme(legend.position = "none")
+
+        combined <- plot_grid(p1, p2, ncol=2, align="hv", labels=c("A", "B"))
+        final_plot <- plot_grid(combined, legend, ncol=1, rel_heights=c(1, 0.1))
+
+        # Save
+        ggsave("{output.pdf}", plot=final_plot, width=12, height=6, dpi=600)
+
+        snpgdsClose(genofile)
+        '
+        """

@@ -1,11 +1,10 @@
 import pandas as pd
-configfile: "config_main.yaml"
+import os
+configfile: "/data/users/rchoudhury/snakeSNPcalling/config_main.yaml"
 
 samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
 final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
-
-
-
+temp_path = "results" + "/" + config["PROJECT"]
 sample=samples["sample"]
 prefix=samples["prefix"]
 
@@ -14,6 +13,12 @@ wildcard_constraints:
     sample = "|".join(samples["sample"])
 
 GENOME = config["GENOME"]
+TRIMMING = config["TRIMMING"]
+
+if TRIMMING == "yes":
+    print("Working on trimmed fastq files")
+else:
+    print("Working on raw fastq files")
 
 units = pd.read_csv(config["METAFILE"],sep='\t')[["sample","prefix"]]
 dunits = units.groupby('sample').agg(lambda x: x.tolist()).to_dict('index')
@@ -26,7 +31,7 @@ def get_fastq(wildcards):
 
 def get_trimmed_fastq(wildcards):
     fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
-    return {"r1": os.path.join(final_path + "data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join(final_path + "data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
+    return {"r1": os.path.join(final_path + "/data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join(final_path + "/data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
 
 
 
@@ -45,26 +50,30 @@ rule end:
 
 
 
-
+# if trimming is yes then use unpack(get_trimmed_fastq), else use unpack(get_fastq)
 rule mapping:
     input:
-        unpack(get_fastq),
+        r1 = lambda wildcards: get_trimmed_fastq(wildcards)["r1"] if TRIMMING == "yes" else get_fastq(wildcards)["r1"],
+        r2 = lambda wildcards: get_trimmed_fastq(wildcards)["r2"] if TRIMMING == "yes" else get_fastq(wildcards)["r2"],
         reference=GENOME
     output:
-        bam=final_path + "/mapped/{prefix}.bam",
-        bai=final_path + "/mapped/{prefix}.bam.bai"
+        bam=temp(final_path  + "/mapped/{prefix}.bam"),
+        bai=temp(final_path  + "/mapped/{prefix}.bam.bai")
     benchmark:
         "benchmarks/mapping/mapping_{prefix}.txt"
     threads:
-        12
+        20
+    resources:
+        time="1-0",
+        sample=4
     params:
         lane=lambda wildcards : get_read_group(wildcards)['lane'],
         sampleid = lambda wildcards : get_read_group(wildcards)['sampleid'],
         platform = "illumina",
-        outputpath = final_path + "/mapped"
+        outputpath = temp_path + "/mapped"
     shell:
        """ 
-        bwa mem -t {threads} -R '@RG\\tID:{wildcards.prefix}\\tSM:{params.sampleid}' {input.reference} {input.r1} {input.r2} | \
+        bwa mem -t {threads} -R '@RG\\tID:{wildcards.prefix}\\tSM:{params.sampleid}\\tPL:ILLUMINA\\tPU:{params.sampleid}:{wildcards.prefix}:{params.lane}' {input.reference} {input.r1} {input.r2} | \
         sambamba view --nthreads={threads} --show-progress --sam-input --format=bam --with-header /dev/stdin | \
         sambamba sort --nthreads={threads} --show-progress --tmpdir=tmp --out={params.outputpath}/{wildcards.prefix}.bam /dev/stdin
         sambamba index --nthreads={threads} {params.outputpath}/{wildcards.prefix}.bam
@@ -75,9 +84,13 @@ rule MergeBamLanes:
     input:
         bamin = lambda wildcards: expand( final_path + "/mapped/{unit}.bam",unit=dunits[wildcards.sample]["prefix"])
     output:
-        out=final_path + "/merged_samples/{sample}.bam"
+        out=temp(final_path  + "/merged_samples/{sample}.bam"),
+        bai=temp(final_path  + "/merged_samples/{sample}.bam.bai"),
     benchmark:
         "benchmarks/merged/{sample}.txt"
+    resources:
+        time="1-0",
+        sample=4
     threads: 12
     params:
         inbam= lambda wildcards, input: " ".join(input.bamin)
@@ -97,16 +110,21 @@ rule MarkDuplicates:
     benchmark:
         "benchmarks/dedup/{sample}.txt"
     threads: 12
+    resources:
+        time="1-0",
+        mem_mb=20000,
+        sample=4
     params:
         outputpath = final_path + "/dedup"
     conda:
         "../env/markduplicates.yaml"
     shell:
         """
-        picard -Xmx4g -Xms1g MarkDuplicates I={input.bam} O={params.outputpath}/{wildcards.sample}.bam \
+        picard -Xmx8g -Djava.io.tmpdir={resources.tmpdir} -Xms1g MarkDuplicates I={input.bam} O={params.outputpath}/{wildcards.sample}.bam \
         M={params.outputpath}/{wildcards.sample}.duplicates.txt VALIDATION_STRINGENCY=SILENT \
         REMOVE_DUPLICATES=false TAGGING_POLICY=All REMOVE_SEQUENCING_DUPLICATES=TRUE TMP_DIR={resources.tmpdir} \
-        SORTING_COLLECTION_SIZE_RATIO=0.1
+        SORTING_COLLECTION_SIZE_RATIO=0.1 TMP_DIR={resources.tmpdir} \
+        OPTICAL_DUPLICATE_PIXEL_DISTANCE=2500
         sambamba index --nthreads={threads} {params.outputpath}/{wildcards.sample}.bam
         """
 
@@ -114,7 +132,6 @@ rule CoverageReport:
     input:
         bam=final_path + "/dedup/{sample}.bam"
     output:
-        out=final_path + "/coverage/{sample}.txt",
         summ=final_path + "/coverage/{sample}_summaryStats.txt",
         bamtools=final_path + "/coverage/{sample}_bamtools_stats.txt"
     benchmark:
@@ -132,6 +149,7 @@ rule CoverageReport:
         echo -n -e "% genome (breadth) covered >10x:\t" >> {output.summ}
         cat {params.outputpath}/{wildcards.sample}.txt | awk '{{c++; if($3>10) total+=1}}END{{print (total/c)*100}}' >> {output.summ}
         bamtools stats -in {input.bam} | grep -v "*" >  {params.outputpath}/{wildcards.sample}_bamtools_stats.txt
+        rm {params.outputpath}/{wildcards.sample}.txt
         """
 
 rule genomeCov:
@@ -153,8 +171,7 @@ rule deeptoolsCov:
     input:
         final_path + "/dedup/{sample}.bam"
     output:
-        final_path + "/bamcoverage/deeptools/{sample}_coverage.pdf",
-        final_path + "/bamcoverage/deeptools/{sample}_coverage.txt"
+        final_path + "/bamcoverage/deeptools/{sample}_coverage.pdf"
     benchmark:
         "benchmarks/deeptoolsCov/deeptoolsCov_{sample}.txt"
     params:
@@ -162,11 +179,14 @@ rule deeptoolsCov:
     conda:
         "../env/bamcoverage.yaml"
     threads: 12
+    resources:
+        mem_mb=100000
     shell:
         """
         plotCoverage  -b {input} --outRawCounts {params.output}.txt \
         --ignoreDuplicates --minMappingQuality 10 \
         -n 1000000000 -p {threads} -o {params.output}.pdf
+        rm {params.output}.txt
         """
 
 rule goleftCov:
@@ -193,7 +213,8 @@ rule samtoolsStats:
     output:
         stat=final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",
         idxstat=final_path + "/bamcoverage/samtools/{sample}_samtools_idxstats.txt",
-        coverage=final_path + "/bamcoverage/samtools/{sample}_coverage.txt"
+        coverage=final_path + "/bamcoverage/samtools/{sample}_coverage.txt",
+        coverage_histo=final_path + "/bamcoverage/samtools/{sample}_coverage_histo.txt"
     benchmark:
         "benchmarks/samtoolsStats/samtoolsStats_{sample}.txt"
     shell:
@@ -201,13 +222,13 @@ rule samtoolsStats:
         samtools stats {input} > {output.stat}
         samtools idxstats {input} > {output.idxstat}
         samtools coverage -H {input} > {output.coverage}
+        samtools coverage  -m --plot-depth -A {input} > {output.coverage_histo}
         """
 
 rule multiqcCoverage:
     input:
         samtools=expand(final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",sample=sample),
         ped=final_path + "/bamcoverage/goleft/report/report-indexcov.ped",
-        deeptools=expand(final_path + "/bamcoverage/deeptools/{sample}_coverage.txt",sample=sample),
         stats = expand(final_path + "/coverage/{sample}_bamtools_stats.txt",sample=sample)
     output:
         final_path + "/bamcoverage/multiqc_report.html"

@@ -9,3 +9,13 @@ tmp/
 logs/
 benchmarks/
 test/
+results/
+data/intervals/
+data/outgroup/
+data/reference/
+
+indexcov.log
+configs/metadata_new_to_fix.tsv
+configs/metadata.tsv
+scatter_units.list
+configs/samples.tsv

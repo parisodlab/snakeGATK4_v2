@@ -1,19 +1,19 @@
 # Please check the parameters, and adjust them according to your circumstance
 
 # Project name
-PROJECT: "Bacteriophora_exerimental_evolution2"
+PROJECT: "Biscutella_remapping_varia"
 
 # ================== Control of the workflow ==================
 
 ## Do you need to do quality control?
-QC: no  # "yes" or "no"
+QC: no # "yes" or "no"
 
 ## Do you need to do trimming?
-TRIMMING: no  # "yes" or "no"?
+TRIMMING: "yes" # "yes" or "no"?
 
 
 GENOME:
-    "/data/users/vogi/genome/current_assembly.fasta"
+    "/data/users/rchoudhury/Biscutella_Genomes/data/Varia_review2.FINAL.Syri.fa"
 
 
 # set SCAFFOLDS as "ALL" if you want to run on all scaffolds :: impliment only if limited number of scaffolds, else split snakemake into multiple jobs :: test it
@@ -22,25 +22,49 @@ SCAFFOLDS:
     "ALL"
 
 METAFILE:
-    "/data/users/vogi/metadata_Vera_020924.txt"
+    "/data/users/rchoudhury/snakeSNPcalling/configs/metadata_fixed.tsv"
 
-FINALOUTPUT: /data/users/vogi
+INPUT:
+    "/data/users/rchoudhury/Biscutella_wgs_remapping_2025/data/raw/all"
+FINALOUTPUT: /data/users/rchoudhury/snakeSNPcalling/results
+
+# Directory where log files for each pipeline step will be stored
+log_folder: "logs"
 
 tmpdir: "tmp"
 
-PLOIDY: 2
+scatter_mode: "interval" # "chromosome" or "interval"
+intervals_dir: "data/intervals"
+scatter_count: 100
 
 # Following https://github.com/AndersenLab/wi-gatk/blob/master/main.nf for values
 HaplotypeCaller:
-  minConfidenceForVariantCalling: "20"
-  min_depth: 5
+  minConfidenceForVariantCalling: "20" # would not be used in haplotypecaller, but instead in genotypegvfs
+
+# Quality by Depth (QD) < 1.5 (for tetraploid), FisherStrand (FS) > 60.0, RMSMappingQuality (MQ) < 40.0, MappingQualityRankSumTest (MQRS) < −12.5, ReadPosRankSum < −8.0, StrandOddsRatio (SOR) > 3.0
+  min_depth: 4
   qual: 30.0
-  strand_odds_ratio: 5.0
-  quality_by_depth: 20.0
-  fisherstrand: 100.0
+  strand_odds_ratio: 3.0
+  quality_by_depth: 1.5
+  fisherstrand: 60.0
+  RMSMappingQuality: 40.0
+  MappingQualityRankSumTest: -12.5
+  ReadPosRankSum: -8.0
   high_missing: 0.95
   high_heterozygosity: 0.10
-  GQ: 15.0
+  # GQ: 10.0 do not use GQ filter, instead work on depth , 8 for tetra, 4 for dip
+
+GenotypeGVCFs:
+  minConfidenceForVariantCalling: "10"
+
+GATK:
+  min_depth:
+    tetra: 8
+    di: 4
+  max_depth:
+    tetra: 150
+    di: 150
+
 
 
 FreeBayes:
@@ -52,3 +76,19 @@ FreeBayes:
   min_mapping_quality: 20 # minimum mapping quality for variant calling
 
 
+
+Structure:
+  # ───── choose run mode ─────
+  run_mode: "bestK"        # "fixed"  or  "bestK", changing to always use bestK
+  ks: [1, 2, 3, 4, 5]   # always the range you want explored, even when you know the bestK, give a range of at least 3
+  bestK: 3          # if run_mode is "fixed", this is the K value to use
+  replicates: 10
+  burnin: 100000 # Number of burn-in iterations
+  mcmc: 1000000 # Total number of iterations
+  ploidy: 4 # Ploidy of the organism (default is 2 for diploid)
+  time: "2-00:00:00" # Time limit for the job, adjust as needed
+
+
+PCA:
+  # ───── PCA parameters ─────
+  ploidy: mixed # "diploid", "tetraploid" or "mixed"
