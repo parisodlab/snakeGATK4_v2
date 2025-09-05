@@ -376,8 +376,8 @@ rule depth_filter:
     input:
         vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     output:
-        filtered_vcf = final_path + "/gatk4/final_vcf/vcfs_by_ploidy/ploidy_{ploidy}.filtered.vcf.gz",
-        filtered_vcf_tbi = final_path + "/gatk4/final_vcf/vcfs_by_ploidy/ploidy_{ploidy}.filtered.vcf.gz.tbi"
+        filtered_vcf = temp(final_path + "/gatk4/final_vcf/vcfs_by_ploidy/ploidy_{ploidy}.filtered.vcf.gz"),
+        filtered_vcf_tbi = temp(final_path + "/gatk4/final_vcf/vcfs_by_ploidy/ploidy_{ploidy}.filtered.vcf.gz.tbi")
     threads:
         30
     run:
@@ -450,10 +450,10 @@ rule Filter_missingness:
     benchmark:
         "benchmarks/FilterVCFminAF_and_missingness/Filter_missingness.txt"
     threads:
-        30
+        8
     resources:
         mem_mb = 8000,
-        time = "2-00:00"
+        time = "10-00:00"
     params:
         outputpath = final_path + "/gatk4/final_vcf/"
     conda:
@@ -467,10 +467,33 @@ rule Filter_missingness:
         bcftools stats -s- --threads {threads} --verbose {params.outputpath}missingness_filtered.vcf.gz > {params.outputpath}missingness_filtered.stats.txt
         """
 
+rule filter_BIALLELIC_SNP:
+    input:
+        vcf=final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz"
+    output:
+        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.stats.txt"
+    benchmark:
+        "benchmarks/FilterBiallelicSNP/FilterBiallelicSNP.txt"
+    threads:
+        30
+    resources:
+        mem_mb = 8000,
+        time = "2-00:00"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view -v snps --threads {threads} -O u {input[0]} |\
+            bcftools view -m2 -M2 -Oz --threads {threads} -o {params.outputpath}biallelic_filtered.vcf.gz
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}biallelic_filtered.vcf.gz > {params.outputpath}biallelic_filtered.stats.txt
+        """
 
 rule FilterVCFminAF:
     input:
-        vcf=final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz"
+        vcf=final_path + "/gatk4/final_vcf/biallelic_snp_filtered.vcf.gz"
     output:
         final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
         final_path + "/gatk4/final_vcf/af_filtered.vcf.gz.tbi",
@@ -506,10 +529,10 @@ rule filter_4_fold_degenerate:
     benchmark:
         "benchmarks/Filter4FoldDegenerate/Filter4FoldDegenerate.txt"
     threads:
-        30
+        8
     resources:
         mem_mb = 8000,
-        time = "2-00:00"
+        time = "10-00:00"
     params:
         outputpath = final_path + "/gatk4/final_vcf/"
     conda:

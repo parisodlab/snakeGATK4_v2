@@ -1,0 +1,9 @@
+name: pixy
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - pixy
+  - htslib
+  - samtools=1.21
+  - bcftools

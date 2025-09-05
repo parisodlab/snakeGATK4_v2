@@ -1,0 +1,642 @@
+import pandas as pd
+import os
+configfile: "config.yaml"
+
+samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["sample"], drop=False)
+final_path = config["final_output"] 
+
+sample=samples["sample"]
+
+GENOME = config["GENOME"]
+
+samples_ploidy = samples["ploidy"].to_dict()
+ploidies = samples["ploidy"].unique().tolist()
+print(ploidies)
+
+# Depth thresholds per ploidy
+ploidy_dp = {
+    "2": {"min": config["GATK"]["min_depth"]["di"], "max": config["GATK"]["max_depth"]["di"]},
+    "4": {"min": config["GATK"]["min_depth"]["tetra"], "max": config["GATK"]["max_depth"]["tetra"]}
+}
+
+# interval scattering parameters (override in config.yaml)
+INTERVALS_DIR = config.get("intervals_dir", "intervals")
+SCATTER_COUNT = int(config.get("scatter_count", 20))
+
+
+
+rule end:
+    input:
+        final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz",
+        final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.stats.txt",
+        final_path + "/gatk4/final_vcf/multiqc_report.html",
+        final_path + "/gatk4/final_vcf/dp_distribution_numgeno.pdf",
+        final_path + "/gatk4/final_vcf/dp_distribution_numsites.pdf"
+        
+
+
+    # Helper function for interval filenames
+    def scattered_interval_name(i):
+        """Return e.g. '0000-scattered.interval_list' for i=0."""
+        return f"{i:04d}-scattered.interval_list"
+
+    # Get intervals dir and scatter count from config
+    INTERVALS_DIR = config["intervals_dir"]
+    SCATTER_COUNT = config["scatter_count"]
+    SCATTERED_INTERVAL_LISTS = [
+        os.path.join(INTERVALS_DIR, scattered_interval_name(i))
+        for i in range(SCATTER_COUNT)
+    ]
+
+    rule scatter_filtered_vcf:
+        input:
+            vcf = final_path + "/gatk4/final_vcf/raw.vcf.gz"
+        output:
+            scattered = temp(final_path + "/gatk4/final_vcf/scattered/scattered_{i}.vcf.gz"),
+            scattered_tbi = temp(final_path + "/gatk4/final_vcf/scattered/scattered_{i}.vcf.gz.tbi")
+        params:
+            interval = lambda wildcards: os.path.join(INTERVALS_DIR, f"{int(wildcards.i):04d}-scattered.interval_list"),
+            outdir = final_path + "/gatk4/final_vcf/scattered",
+        threads: 4
+        conda:
+            "../env/gatk4_calling_env.yaml"
+        shell:
+            """
+            mkdir -p {params.outdir}
+            gatk SelectVariants -R {GENOME} -V {input.vcf} -L {params.interval} -O {output.scattered}
+            bcftools index --tbi {output.scattered}
+            """
+
+
+
+rule SplitVariant:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/scattered/scattered_{i}.vcf.gz"
+    output:
+        vcf=temp(final_path + "/gatk4/final_vcf/scattered/variant_{i}.vcf.gz"),
+        index=temp(final_path + "/gatk4/final_vcf/scattered/variant_{i}.vcf.gz.tbi")
+    benchmark:
+        "benchmarks/SplitVariantAndInvariant/SplitVariant.{i}.txt"
+    threads:
+        4
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/scattered/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        r"""
+        # filter variant sites within this scatter (keep sites with MAC>0)
+        bcftools filter --threads {threads} -i "MAC > 0 && F_MISSING <= 0.5" {input.vcf} -O z > {output.vcf}
+        bcftools index --tbi {output.vcf}
+        """
+
+
+rule SplitInvariant:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/scattered/scattered_{i}.vcf.gz"
+    output:
+        invariant=temp(final_path + "/gatk4/final_vcf/scattered/invariant_{i}.vcf.gz"),
+        invariant_index=temp(final_path + "/gatk4/final_vcf/scattered/invariant_{i}.vcf.gz.tbi")
+    benchmark:
+        "benchmarks/SplitVariantAndInvariant/SplitInvariant.{i}.txt"
+    threads:
+        4
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/scattered/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        r"""
+        # filter invariant sites within this scatter (MAC == 0)
+        bcftools filter --threads {threads} -i "MAC == 0 && F_MISSING <= 0.5" {input.vcf} -O z > {output.invariant}
+        bcftools index --tbi {output.invariant}
+        """
+
+
+
+rule MarkFilterVariant:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/scattered/variant_{i}.vcf.gz",
+        vcf_tbi = final_path + "/gatk4/final_vcf/scattered/variant_{i}.vcf.gz.tbi"
+    output:
+        vcf=temp(final_path + "/gatk4/final_vcf/scattered/mark-filter_variant_{i}.vcf.gz"),
+        index=temp(final_path + "/gatk4/final_vcf/scattered/mark-filter_variant_{i}.vcf.gz.tbi")
+    benchmark:
+        "benchmarks/SoftFilter/MarkFilter_variant.{i}.txt"
+    threads:
+        4
+    params:
+        qual = config["HaplotypeCaller"]["qual"],
+        fisherstrand = config["HaplotypeCaller"]["fisherstrand"],
+        quality_by_depth = config["HaplotypeCaller"]["quality_by_depth"],
+        strand_odds_ratio = config["HaplotypeCaller"]["strand_odds_ratio"],
+        RMSMappingQuality = config["HaplotypeCaller"]["RMSMappingQuality"],
+        MappingQualityRankSumTest = config["HaplotypeCaller"]["MappingQualityRankSumTest"],
+        ReadPosRankSum = config["HaplotypeCaller"]["ReadPosRankSum"],
+        outputpath = final_path + "/gatk4/final_vcf/scattered/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk --java-options "-Xmx12g -Xms12g" \
+            VariantFiltration \
+            --verbosity ERROR \
+            -R {GENOME} \
+            --variant {input.vcf} \
+            --filter-expression "QUAL < {params.qual}"                --filter-name "QUAL_quality" \
+            --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
+            --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
+            --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
+            --filter-expression "RMSMappingQuality < {params.RMSMappingQuality}" --filter-name "RMSMappingQuality" \
+            --filter-expression "MappingQualityRankSumTest < {params.MappingQualityRankSumTest}" --filter-name "MappingQualityRankSumTest" \
+            --filter-expression "ReadPosRankSum < {params.ReadPosRankSum}" --filter-name "ReadPosRankSum" \
+            -O {output.vcf}
+
+        bcftools index --tbi {output.vcf}
+        """
+
+rule MarkFilterInvariant:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/scattered/invariant_{i}.vcf.gz",
+        vcf_tbi = final_path + "/gatk4/final_vcf/scattered/invariant_{i}.vcf.gz.tbi"
+    output:
+        vcf=temp(final_path + "/gatk4/final_vcf/scattered/mark-filter_invariant_{i}.vcf.gz"),
+        index=temp(final_path + "/gatk4/final_vcf/scattered/mark-filter_invariant_{i}.vcf.gz.tbi")
+    benchmark:
+        "benchmarks/SoftFilter/MarkFilter_invariant.{i}.txt"
+    threads:
+        4
+    params:
+        fisherstrand = config["HaplotypeCaller"]["fisherstrand"],
+        quality_by_depth = config["HaplotypeCaller"]["quality_by_depth"],
+        strand_odds_ratio = config["HaplotypeCaller"]["strand_odds_ratio"],
+        RMSMappingQuality = config["HaplotypeCaller"]["RMSMappingQuality"],
+        MappingQualityRankSumTest = config["HaplotypeCaller"]["MappingQualityRankSumTest"],
+        ReadPosRankSum = config["HaplotypeCaller"]["ReadPosRankSum"],
+        outputpath = final_path + "/gatk4/final_vcf/scattered/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk --java-options "-Xmx12g -Xms12g" \
+            VariantFiltration \
+            --verbosity ERROR \
+            -R {GENOME} \
+            --variant {input.vcf} \
+            --filter-expression "FS > {params.fisherstrand}"          --filter-name "FS_fisherstrand" \
+            --filter-expression "QD < {params.quality_by_depth}"      --filter-name "QD_quality_by_depth" \
+            --filter-expression "SOR > {params.strand_odds_ratio}"    --filter-name "SOR_strand_odds_ratio" \
+            --filter-expression "RMSMappingQuality < {params.RMSMappingQuality}" --filter-name "RMSMappingQuality" \
+            --filter-expression "MappingQualityRankSumTest < {params.MappingQualityRankSumTest}" --filter-name "MappingQualityRankSumTest" \
+            --filter-expression "ReadPosRankSum < {params.ReadPosRankSum}" --filter-name "ReadPosRankSum" \
+            -O {output.vcf}
+
+        bcftools index --tbi{output.vcf}
+        """
+
+rule ApplyFilter_variants:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/scattered/mark-filter_variant_{i}.vcf.gz",
+        vcf_tbi = final_path + "/gatk4/final_vcf/scattered/mark-filter_variant_{i}.vcf.gz.tbi"
+    output:
+        temp(final_path + "/gatk4/final_vcf/scattered/filtered_variant_{i}.vcf.gz"),
+        temp(final_path + "/gatk4/final_vcf/scattered/filtered_variant_{i}.vcf.gz.tbi")
+    benchmark:
+        "benchmarks/ApplyFilter/ApplyFilter_variants.{i}.txt"
+    threads:
+        4
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/scattered/",
+        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"]
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+            bcftools filter --threads {threads} -O u --exclude 'FILTER != "PASS"' {input.vcf} |\
+            bcftools view --threads {threads} -O z > {output[0]}
+
+        bcftools index {output[0]}
+        bcftools index --tbi {output[0]}
+        """
+
+rule ApplyFilter_invariants:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/scattered/mark-filter_invariant_{i}.vcf.gz",
+        vcf_tbi = final_path + "/gatk4/final_vcf/scattered/mark-filter_invariant_{i}.vcf.gz.tbi"
+    output:
+        temp(final_path + "/gatk4/final_vcf/scattered/filtered_invariant_{i}.vcf.gz"),
+        temp(final_path + "/gatk4/final_vcf/scattered/filtered_invariant_{i}.vcf.gz.tbi")
+    benchmark:
+        "benchmarks/ApplyFilter/ApplyFilter_invariants.{i}.txt"
+    threads:
+        4
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/scattered/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+            bcftools filter --threads {threads} -O u --exclude 'FILTER != "PASS"' {input.vcf} |\
+            bcftools view --threads {threads} -O z > {output[0]}
+
+        bcftools index {output[0]}
+        bcftools index --tbi {output[0]}
+        """
+
+rule MergeVariantAndInvariant_scatter:
+    """Merge variant and invariant filtered files for a single scatter into a per-scatter filtered VCF."""
+    input:
+        variant = final_path + "/gatk4/final_vcf/scattered/filtered_variant_{i}.vcf.gz",
+        invariant = final_path + "/gatk4/final_vcf/scattered/filtered_invariant_{i}.vcf.gz"
+    output:
+        filtered = temp(final_path + "/gatk4/final_vcf/scattered/filtered_{i}.vcf.gz"),
+        stats = temp(final_path + "/gatk4/final_vcf/scattered/filtered_{i}.stats.txt")
+    benchmark:
+        "benchmarks/MergeVariantAndInvariant/MergeVariantAndInvariant.{i}.txt"
+    threads:
+        6
+    resources:
+        mem_mb = 8000,
+        time = "1-0"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        # per-scatter concat of variant and invariant filtered files
+        bcftools concat -a --threads {threads} -O z {input.variant} {input.invariant} -o {output.filtered}
+        bcftools index --tbi {output.filtered}
+        """
+
+
+rule MergeVariantAndInvariant:
+    """Concatenate per-scatter filtered VCFs into the final filtered.vcf.gz and apply soft filters."""
+    input:
+        filtered_scattered = expand(final_path + "/gatk4/final_vcf/scattered/filtered_{i}.vcf.gz", i=range(SCATTER_COUNT))
+    output:
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/filtered.stats.txt"
+    benchmark:
+        "benchmarks/MergeVariantAndInvariant/MergeVariantAndInvariant.txt"
+    threads:
+        20
+    resources:
+        mem_mb = 8000,
+        time = "3-0"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/",
+        high_heterozygosity = config["HaplotypeCaller"]["high_heterozygosity"],
+        high_missing = config["HaplotypeCaller"]["high_missing"]
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        # concatenate all per-scatter filtered VCFs, then apply soft filters
+        bcftools concat -a --threads {threads} -O u {input.filtered_scattered} |\
+        bcftools filter -O u --threads {threads} --soft-filter='high_heterozygosity' --mode + --include '( COUNT(GT="het") / N_SAMPLES ) <= {params.high_heterozygosity}' |\
+        bcftools filter --threads {threads} --soft-filter='high_missing' --mode + --include 'F_MISSING  <= {params.high_missing}' -O z > {output[0]}
+        bcftools index {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats --threads {threads} -s- --verbose {output[0]} > {output[2]}
+        """
+
+
+
+# Run bcftools stats (temporary)
+rule bcftools_stats:
+    input:
+        vcf = final_path + "/gatk4/final_vcf/filtered.vcf.gz",
+        idx = final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi"
+    output:
+        temp(final_path + "/gatk4/final_vcf/per_sample/{sample}_dp.txt")
+    threads:
+        30
+    params:
+        sample = lambda wildcards: wildcards.sample
+    shell:
+        """
+        bcftools view -s {params.sample} {input.vcf} -Oz --threads {threads} -o $SCRATCH/{params.sample}.vcf.gz
+        bcftools stats  -s- $SCRATCH/{params.sample}.vcf.gz | grep '^DP' > {output}
+
+    # Add more downstream rules as needed, using scattered_vcf as input and running in parallel over i in range(SCATTER_COUNT)
+        """
+
+
+# Combine DP stats (kept)
+rule combine_dp:
+    input:
+        dp_files = expand(final_path + "/gatk4/final_vcf/per_sample/{sample}_dp.txt", sample=sample)
+    output:
+        final_path + "/gatk4/final_vcf/combined_dp_filtered.tsv"
+    run:
+        import pandas as pd
+
+        all_dp = []
+        for file in input.dp_files:
+            sample = file.split('/')[-1].replace('_dp.txt','')
+            df = pd.read_csv(file, sep='\t', header=None)
+            # Select relevant columns: Bin = col 3, NumSites = col 6
+            df = df[[2,3,4,5,6]]
+            df.columns = ['Bin','NumGeno','fracGeno', 'NumSites','fracSites']
+            # remove last line
+            df = df[:-1]
+            df['Bin'] = df['Bin'].astype(int)
+            df['NumSites'] = df['NumSites'].astype(int)
+            df['Sample'] = sample
+            all_dp.append(df)
+
+        df_all = pd.concat(all_dp, ignore_index=True)
+        df_all.to_csv(output[0], sep='\t', index=False)
+
+# Plot DP (kept)
+rule plot_dp:
+    input:
+        combined_dp=final_path + "/gatk4/final_vcf/combined_dp_filtered.tsv"
+    output:
+        final_path + "/gatk4/final_vcf/dp_distribution_numgeno.pdf",
+        final_path + "/gatk4/final_vcf/dp_distribution_numsites.pdf"
+    conda:
+        "../env/plot_dp.yaml"
+    script:
+        "../scripts/dp_histogram_modes.py"
+
+
+
+checkpoint split_by_ploidy:
+    """Create per-scatter, per-ploidy VCFs from a single scattered chunk (runs per scatter)."""
+    input:
+        scattered = final_path + "/gatk4/final_vcf/scattered/filtered_{i}.vcf.gz"
+    output:
+        directory(temp(final_path + "/gatk4/final_vcf/vcfs_by_ploidy/scatter_{i}"))
+    threads: 4
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    run:
+        import os
+        os.makedirs(output[0], exist_ok=True)
+        # produce one ploidy_<ploidy>.vcf.gz per declared ploidy inside the scatter dir
+        for ploidy in ploidies:
+            ploidy_samples = [s for s, p in samples_ploidy.items() if str(p) == str(ploidy)]
+            out_vcf = os.path.join(output[0], f"ploidy_{ploidy}.vcf.gz")
+            if not ploidy_samples:
+                # create header-only VCF so downstream rules have a file to consume
+                shell(f"bcftools view -h {input.scattered} | bgzip -c > {out_vcf}")
+                shell(f"tabix -p vcf {out_vcf}")
+                continue
+            sample_list = ",".join(ploidy_samples)
+            shell(f"bcftools view -s {sample_list} {input.scattered} -O z --threads {threads} -o {out_vcf}")
+            shell(f"bcftools index --tbi {out_vcf}")
+
+
+# Depth filtering per ploidy
+rule depth_filter:
+    input:
+        vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get(i=wildcards.i).output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
+    output:
+        filtered_vcf = final_path + "/gatk4/final_vcf/vcfs_by_ploidy/scatter_{i}/ploidy_{ploidy}.filtered.vcf.gz",
+        filtered_vcf_tbi = final_path + "/gatk4/final_vcf/vcfs_by_ploidy/scatter_{i}/ploidy_{ploidy}.filtered.vcf.gz.tbi"
+    threads:
+        4
+    run:
+        import os
+        ploidy = wildcards.ploidy
+        dp_min = ploidy_dp[str(ploidy)]["min"]
+        dp_max = ploidy_dp[str(ploidy)]["max"]
+        vcf = input.vcf if isinstance(input.vcf, str) else input[0]
+        out_vcf = output.filtered_vcf
+        os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+        # run bcftools to produce a gzipped filtered VCF matching the declared output
+        shell(f"bcftools filter --threads {threads} -e 'FORMAT/DP<{dp_min}' --set-GTs . -Ou {vcf} | bcftools filter --threads {threads} -e 'FORMAT/DP>{dp_max}' --set-GTs . -Oz -o {out_vcf}")
+        shell(f"bcftools index --tbi {out_vcf}")
+
+rule merge_filtered_vcfs:
+    # merge per-ploidy filtered VCFs for a given scatter into a per-scatter merged VCF
+    input:
+        vcfs=lambda wildcards: [os.path.join(final_path, "gatk4/final_vcf/vcfs_by_ploidy", f"scatter_{wildcards.i}", f"ploidy_{p}.filtered.vcf.gz") for p in ploidies]
+    output:
+        merged = temp(final_path + "/gatk4/final_vcf/scattered/merged_{i}.vcf.gz")
+    threads:
+        4
+    run:
+        import tempfile, os
+        from pathlib import Path
+
+        vcfs = [v for v in input.vcfs if os.path.exists(v)]
+        if len(vcfs) == 0:
+            raise ValueError("No filtered VCFs found to merge for scatter {wildcards.i}!")
+        elif len(vcfs) == 1:
+            shell("cp {vcfs[0]} {output.merged}")
+        else:
+            tmpdir = tempfile.mkdtemp()
+            fixed_vcfs = []
+
+            for vcf in vcfs:
+                base = Path(vcf).stem.replace(".vcf", "")
+                header = os.path.join(tmpdir, f"{base}.header.txt")
+                fixed = os.path.join(tmpdir, f"{base}.fixed.vcf.gz")
+
+                # extract header, fix AD, and reheader
+                shell("bcftools view -h {vcf} > {header}")
+                shell("sed -i 's/##FORMAT=<ID=AD,Number=R/##FORMAT=<ID=AD,Number=./' {header}")
+                shell("""bcftools reheader -h {header} {vcf} | \
+                bcftools annotate --threads {threads} -x FORMAT/PL -O z -o {fixed} """)
+                shell("bcftools index --threads {threads} --tbi {fixed}")
+
+                fixed_vcfs.append(fixed)
+
+            # merge fixed vcfs
+            vcfs_str = " ".join(fixed_vcfs)
+            shell("bcftools merge {vcfs_str} --threads {threads} -O z -o {output.merged}")
+
+            shell("rm -rf {tmpdir}")
+
+
+
+rule Filter_missingness:
+    input:
+        vcf=lambda wildcards: final_path + f"/gatk4/final_vcf/scattered/merged_{wildcards.i}.vcf.gz"
+    output:
+        temp(final_path + "/gatk4/final_vcf/scattered/missingness_filtered_{i}.vcf.gz"),
+        temp(final_path + "/gatk4/final_vcf/scattered/missingness_filtered_{i}.stats.txt")
+    benchmark:
+        "benchmarks/FilterVCFminAF_and_missingness/Filter_missingness.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000,
+        time = "2-00:00"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view --threads {threads} -O v -i 'F_MISSING <= 0.5'  {input[0]} |\
+            vcffixup - | \
+            bcftools view --threads {threads} -O z > {output[0]}
+        bcftools index {output[0]}
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[1]}
+        """
+
+
+rule FilterVCFminAF:
+    input:
+        vcf=lambda wildcards: final_path + f"/gatk4/final_vcf/scattered/missingness_filtered_{wildcards.i}.vcf.gz"
+    output:
+        temp(final_path + "/gatk4/final_vcf/scattered/af_filtered_{i}.vcf.gz"),
+        temp(final_path + "/gatk4/final_vcf/scattered/af_filtered_{i}.vcf.gz.tbi"),
+        temp(final_path + "/gatk4/final_vcf/scattered/af_filtered_{i}.stats.txt")
+    benchmark:
+        "benchmarks/FilterVCFminAF_and_missingness/FilterVCFminAF.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000,
+        time = "2-00:00"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view --threads {threads} -O v --min-af 0.025 --max-af 0.975 {input[0]} |\
+            bcftools view --threads {threads} -O z > {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[2]}
+        """
+
+rule filter_4_fold_degenerate:
+    input:
+        reference=GENOME,
+        vcf=lambda wildcards: final_path + f"/gatk4/final_vcf/scattered/af_filtered_{wildcards.i}.vcf.gz",
+        degenerate=final_path + "/degeneracy/degeneracy-fourfold.bed"
+    output:
+        temp(final_path + "/gatk4/final_vcf/scattered/4_fold_degenerate_filtered_{i}.vcf.gz"),
+        temp(final_path + "/gatk4/final_vcf/scattered/4_fold_degenerate_filtered_{i}.stats.txt")
+    benchmark:
+        "benchmarks/Filter4FoldDegenerate/Filter4FoldDegenerate.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000,
+        time = "2-00:00"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk SelectVariants \
+            -R {input[0]} \
+            -V {input[1]} \
+            -O {output[0]} \
+            -L {input[2]} \
+            --select-type SNP \
+            --restrict-alleles-to BIALLELIC
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[1]}
+        """
+
+
+rule concat_after_missingness:
+    """Concatenate per-scatter missingness-filtered VCFs into one final VCF."""
+    input:
+        missing_vcfs = expand(final_path + "/gatk4/final_vcf/scattered/missingness_filtered_{i}.vcf.gz", i=range(SCATTER_COUNT))
+    output:
+        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/missingness_filtered.stats.txt"
+    threads: 8
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools concat -a --threads {threads} -O z {input.missing_vcfs} -o {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[2]}
+        """
+
+rule LD_pruning:
+    input:
+        reference=GENOME,
+        vcf=lambda wildcards: final_path + f"/gatk4/final_vcf/scattered/4_fold_degenerate_filtered_{wildcards.i}.vcf.gz"
+    output:
+        temp(final_path + "/gatk4/final_vcf/scattered/4_fold_degenerate_filtered_{i}.ld_pruned.vcf.gz"),
+        temp(final_path + "/gatk4/final_vcf/scattered/4_fold_degenerate_filtered_{i}.ld_pruned.stats.txt")
+    benchmark:
+        "benchmarks/LD_pruning/LD_pruning.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 8000,
+        time = "2-00:00"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        outdir=$(dirname {output[0]})
+        Rscript scripts/LD_prunning.R {input.vcf} ${outdir}/4_fold_degenerate_filtered_{wildcards.i}.ld_pruned.gds {params.outputpath}
+        gatk SelectVariants \
+            -R {input.reference} \
+            -V {input.vcf} \
+            -O {output[0]} \
+            -L {params.outputpath}pruned_snps.intervals
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[1]}
+        """
+
+
+rule concat_after_af:
+    """Concatenate per-scatter AF-filtered VCFs into one final AF-filtered VCF."""
+    input:
+        af_vcfs = expand(final_path + "/gatk4/final_vcf/scattered/af_filtered_{i}.vcf.gz", i=range(SCATTER_COUNT))
+    output:
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/af_filtered.stats.txt"
+    threads: 8
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools concat -a --threads {threads} -O z {input.af_vcfs} -o {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[2]}
+        """
+
+
+rule concat_after_ld:
+    """Concatenate per-scatter LD-pruned VCFs into the final LD-pruned VCF used downstream."""
+    input:
+        pruned_vcfs = expand(final_path + "/gatk4/final_vcf/scattered/4_fold_degenerate_filtered_{i}.ld_pruned.vcf.gz", i=range(SCATTER_COUNT))
+    output:
+        final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz",
+        final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz.tbi",
+        final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.stats.txt"
+    threads: 12
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools concat -a --threads {threads} -O z {input.pruned_vcfs} -o {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[2]}
+        """
+
+rule MultiQC:
+    input:
+    # final concatenated LD-pruned VCF will be produced by a final merge step
+    final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz"
+    output:
+        final_path + "/gatk4/final_vcf/multiqc_report.html"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    params:
+        outputpath = final_path + "/gatk4/final_vcf/"
+    shell:
+        """
+        multiqc {params.outputpath} -o {params.outputpath}
+        """
+
+
+

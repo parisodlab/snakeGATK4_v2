@@ -1,0 +1,8 @@
+name: piawka
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - piawka=0.8.11
+
