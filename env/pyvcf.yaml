@@ -1,0 +1,16 @@
+name: pyvcf
+channels:
+    - conda-forge
+    - bioconda
+    - defaults
+    - R
+dependencies:
+    - bcftools
+    - python=3.10
+    - pip=23.1.2
+    - pip:
+        - matplotlib==3.7.1
+        - pandas==2.0.3
+        - numpy==1.25.2
+        - pysam
+        - scipy

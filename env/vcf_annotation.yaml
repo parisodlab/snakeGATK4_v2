@@ -1,0 +1,17 @@
+name: vcf_annotation
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.10
+  - cyvcf2
+  - numpy
+  - pandas
+  - bcftools
+  - tabix
+  - pip
+  - degenotate=1.3
+  - pip:
+    - scantools
+
