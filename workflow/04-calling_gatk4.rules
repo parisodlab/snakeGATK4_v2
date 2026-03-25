@@ -1,100 +1,280 @@
-import pandas as pd
 import os
+import re
+import pandas as pd
 configfile: "config_main.yaml"
 
-samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+samples = pd.read_csv(config["METAFILE"], sep="\t")
+
+if "sample_lane" not in samples.columns:
+    if {"sample", "lane", "sample_barcode"}.issubset(samples.columns):
+        samples["sample_lane"] = (
+            samples["sample"].astype(str)
+            + "_"
+            + samples["lane"].astype(str)
+            + "_"
+            + samples["sample_barcode"].astype(str)
+        )
+    elif {"sample", "lane"}.issubset(samples.columns):
+        samples["sample_lane"] = samples["sample"].astype(str) + "_" + samples["lane"].astype(str)
+    elif "prefix" in samples.columns:
+        samples["sample_lane"] = samples["prefix"].astype(str)
+    else:
+        raise ValueError(
+            "METAFILE must contain 'sample_lane' or ('sample' and 'lane' [and optionally 'sample_barcode']) or 'prefix'"
+        )
+
+samples["prefix"] = samples["sample_lane"].astype(str)
+samples = samples.set_index(["prefix"], drop=False)
 final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
 
+SEQTYPE = str(config.get("SEQTYPE", "wgs")).strip().lower()
+if SEQTYPE not in {"wgs", "ddrad"}:
+    raise ValueError(f"Invalid SEQTYPE={SEQTYPE!r}. Expected 'wgs' or 'ddrad'.")
+ANALYSIS_BAM_SUBDIR = "merged_samples" if SEQTYPE == "ddrad" else "dedup"
+ANALYSIS_BAM_PATTERN = final_path + f"/{ANALYSIS_BAM_SUBDIR}/{{sample}}.bam"
+ANALYSIS_BAI_PATTERN = final_path + f"/{ANALYSIS_BAM_SUBDIR}/{{sample}}.bam.bai"
+
+if "ploidy" in samples.columns and "sample" in samples.columns:
+    _ploidy_by_sample = (
+        samples[["sample", "ploidy"]]
+        .dropna(subset=["ploidy"])
+        .drop_duplicates(subset=["sample"])
+        .set_index("sample")["ploidy"]
+        .astype(str)
+        .to_dict()
+    )
+else:
+    _ploidy_by_sample = {}
+
 GENOME = config["GENOME"]
-SCATTER_MODE = config["scatter_mode"]         # "chromosome" or "interval"
-SCATTER_COUNT = config.get("scatter_count", 25)
-INTERVALS_DIR = config["intervals_dir"]
-SCAFFS=config["SCAFFOLDS"]
+TMPDIR = str(config.get("tmpdir", "tmp"))
+DEFAULT_SCATTER_MODE = str(config.get("scatter_mode", "interval")).strip().lower()
+DEFAULT_SCATTER_COUNT = int(config.get("scatter_count", 25))
+BASE_INTERVALS_DIR = config["intervals_dir"]
+SCAFFS = config["SCAFFOLDS"]
+DEFAULT_CHROMOSOME_GROUPS = str(config.get("chromosome_groups", "all")).strip()
+HC_SCATTER_MODE = str(config.get("haplotypecaller_scatter_mode", DEFAULT_SCATTER_MODE)).strip().lower()
+HC_SCATTER_COUNT = int(config.get("haplotypecaller_scatter_count", DEFAULT_SCATTER_COUNT))
+HC_CHROMOSOME_GROUPS = str(config.get("haplotypecaller_chromosome_groups", DEFAULT_CHROMOSOME_GROUPS)).strip()
+JOINT_SCATTER_MODE = str(config.get("jointgenotyping_scatter_mode", DEFAULT_SCATTER_MODE)).strip().lower()
+JOINT_SCATTER_COUNT = int(config.get("jointgenotyping_scatter_count", DEFAULT_SCATTER_COUNT))
+JOINT_CHROMOSOME_GROUPS = str(config.get("jointgenotyping_chromosome_groups", DEFAULT_CHROMOSOME_GROUPS)).strip()
+HC_INTERVALS_DIR = os.path.join(BASE_INTERVALS_DIR, "haplotypecaller")
+JOINT_INTERVALS_DIR = os.path.join(BASE_INTERVALS_DIR, "jointgenotyping")
 scaffolds = []
 
-if SCAFFS=="ALL":
-    with open(GENOME,'rt') as fh:
-        for line in fh:
-            line = line.strip()
-            if line.startswith(">"):
-                line = line.split(" ")[0]
-                scaffolds.append(line[1:])
+for scatter_mode_name, scatter_mode_value in {
+    "haplotypecaller_scatter_mode": HC_SCATTER_MODE,
+    "jointgenotyping_scatter_mode": JOINT_SCATTER_MODE,
+}.items():
+    if scatter_mode_value not in {"chromosome", "interval"}:
+        raise ValueError(
+            f"Invalid {scatter_mode_name}={scatter_mode_value!r}. Expected 'chromosome' or 'interval'."
+        )
+
+
+def mode_config(section_name, scatter_mode, defaults):
+    section = config.get(section_name, {})
+    by_mode = section.get("by_scatter_mode", {})
+    mode_values = by_mode.get(scatter_mode, {})
+    merged = dict(defaults)
+    merged.update(mode_values)
+    return merged
+
+
+HC_CFG = mode_config(
+    "HaplotypeCaller",
+    HC_SCATTER_MODE,
+    {
+        "threads": 4,
+        "mem_mb": 8000,
+        "time": "3-0",
+        "java_xms": "6G",
+        "java_xmx": "6G",
+    },
+)
+GDBI_CFG = mode_config(
+    "GenomicsDBImport",
+    JOINT_SCATTER_MODE,
+    {
+        "threads": 4,
+        "mem_mb": 6000,
+        "java_xms": "4G",
+        "java_xmx": "4G",
+        "batch_size": 50,
+        "interval_padding": 1000,
+        "merge_input_intervals": True,
+    },
+)
+GGVCF_CFG = mode_config(
+    "GenotypeGVCFs",
+    JOINT_SCATTER_MODE,
+    {
+        "threads": 4,
+        "mem_mb": 5000,
+        "time": "3-0",
+        "java_heap_mb": None,
+        "max_alternate_alleles": 12,
+        "only_output_calls_starting_in_intervals": True,
+    },
+)
+
+HC_THREADS = int(HC_CFG["threads"])
+HC_MEM_MB = int(HC_CFG["mem_mb"])
+HC_TIME = str(HC_CFG["time"])
+GDBI_THREADS = int(GDBI_CFG["threads"])
+GDBI_MEM_MB = int(GDBI_CFG["mem_mb"])
+GGVCF_THREADS = int(GGVCF_CFG["threads"])
+GGVCF_MEM_MB = int(GGVCF_CFG["mem_mb"])
+GGVCF_TIME = str(GGVCF_CFG["time"])
+COMBINED_GGVCF_THREADS = max(GDBI_THREADS, GGVCF_THREADS)
+COMBINED_GGVCF_MEM_MB = max(GDBI_MEM_MB, GGVCF_MEM_MB)
+
+if SCAFFS == "ALL":
+    fai = GENOME + ".fai"
+    if os.path.exists(fai):
+        with open(fai, "rt") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                scaffolds.append(line.split("\t", 1)[0])
+    else:
+        with open(GENOME, "rt") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(">"):
+                    scaffolds.append(line.split(" ")[0][1:])
 else:
-    with open(SCAFFS,'rt') as sh:
+    with open(SCAFFS, "rt") as sh:
         for line in sh:
             line = line.strip()
-            scaffolds.append(line)
+            if line:
+                scaffolds.append(line)
 
 with open("scaffolds.list", "w") as outfile:
-    outfile.write("\n".join(scaffolds))
+    outfile.write("\n".join(scaffolds) + "\n")
 
 
-sample=samples["sample"]
-prefix=samples["prefix"]
+def parse_chromosome_groups(spec):
+    if spec == "all":
+        return None
+    match = re.fullmatch(r"([A-Za-z_.-]+)(\d+)-(\d+)\+rest", spec)
+    if not match:
+        raise ValueError(
+            "chromosome_groups must be 'all' or a '<prefix><start>-<end>+rest' pattern such as 'Bv1-9+rest'"
+        )
+    prefix, start, end = match.groups()
+    start_i = int(start)
+    end_i = int(end)
+    step = 1 if end_i >= start_i else -1
+    primary = [f"{prefix}{i}" for i in range(start_i, end_i + step, step)]
+    return [name for name in primary if name in scaffolds]
+
+
+HC_PRIMARY_CHROMOSOMES = parse_chromosome_groups(HC_CHROMOSOME_GROUPS)
+JOINT_PRIMARY_CHROMOSOMES = parse_chromosome_groups(JOINT_CHROMOSOME_GROUPS)
+
+
+def get_scatter_units(scatter_mode, scatter_count, primary_chromosomes, label):
+    if scatter_mode == "chromosome":
+        if primary_chromosomes is None:
+            return scaffolds
+        rest = [name for name in scaffolds if name not in set(primary_chromosomes)]
+        units = list(primary_chromosomes)
+        if rest:
+            units.append("REST")
+        print(
+            f"{label} chromosome grouping: {len(primary_chromosomes)} primary + {len(rest)} remaining contigs in REST => {len(units)} scatter units."
+        )
+        return units
+    if scatter_mode == "interval":
+        return [f"{i:04d}-scattered" for i in range(scatter_count)]
+    raise ValueError(f"Unsupported scatter_mode={scatter_mode!r}. Expected 'chromosome' or 'interval'.")
+
+
+HC_SCATTER_UNITS = get_scatter_units(HC_SCATTER_MODE, HC_SCATTER_COUNT, HC_PRIMARY_CHROMOSOMES, "HaplotypeCaller")
+JOINT_SCATTER_UNITS = get_scatter_units(JOINT_SCATTER_MODE, JOINT_SCATTER_COUNT, JOINT_PRIMARY_CHROMOSOMES, "Joint genotyping")
+
+
+def scatter_regions(scatter_mode, primary_chromosomes, scatter_id):
+    if scatter_mode != "chromosome":
+        return []
+    if primary_chromosomes is not None and scatter_id == "REST":
+        primary = set(primary_chromosomes)
+        return [name for name in scaffolds if name not in primary]
+    return [scatter_id]
+
+
+def region_args_for_scatter(wildcards, scatter_mode, primary_chromosomes, intervals_dir):
+    if scatter_mode == "chromosome":
+        return " ".join(
+            f"-L {region}"
+            for region in scatter_regions(scatter_mode, primary_chromosomes, wildcards.scatter_id)
+        )
+    return f"-L {os.path.join(intervals_dir, wildcards.scatter_id + '.interval_list')}"
+
+
+def hc_region_args_for_scatter(wildcards):
+    return region_args_for_scatter(wildcards, HC_SCATTER_MODE, HC_PRIMARY_CHROMOSOMES, HC_INTERVALS_DIR)
+
+
+def joint_region_args_for_scatter(wildcards):
+    return region_args_for_scatter(wildcards, JOINT_SCATTER_MODE, JOINT_PRIMARY_CHROMOSOMES, JOINT_INTERVALS_DIR)
+
+
+with open("hc_scatter_units.list", "w") as f:
+    f.write("\n".join(HC_SCATTER_UNITS) + "\n")
+
+with open("joint_scatter_units.list", "w") as f:
+    f.write("\n".join(JOINT_SCATTER_UNITS) + "\n")
+
+
+sample = samples["sample"].astype(str).unique().tolist()
+prefix = samples["prefix"].astype(str).tolist()
 
 wildcard_constraints:
-    prefix = "|".join(samples.index),
-    sample = "|".join(samples["sample"]),
-    scaffold = "|".join(scaffolds)
+    sample = "[^/]+",
+    scatter_id = "[^/]+",
+    prefix = "[^/]+"
 
-
-
-
-units = pd.read_csv(config["METAFILE"],sep='\t')[["sample","prefix"]]
-dunits = units.groupby('sample').agg(lambda x: x.tolist()).to_dict('index')
-
-
-# Define a function to get the fastq files for a given prefix
-def get_fastq(wildcards):
-    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
-    return {"r1": fastqs.fq1, "r2": fastqs.fq2}
-
-def get_trimmed_fastq(wildcards):
-    fastqs = samples.loc[(wildcards.prefix), ["fq1", "fq2"]].dropna()
-    return {"r1": os.path.join(final_path + "/gatk4data/trimmed",wildcards.prefix + "_R1_001.trim.fastq.gz"), "r2": os.path.join(final_path + "/gatk4data/trimmed",wildcards.prefix + "_R2_001.trim.fastq.gz")}
 
 def get_ploidy(wildcards):
-    ploidy = pd.read_csv(config["METAFILE"],sep='\t').set_index(["sample"], drop=False)[['sample','ploidy']].drop_duplicates()
-    # print("wildcard is %s ploidy is %s"%(wildcards.sample,ploidy.loc[(wildcards.sample), "ploidy"]))
-    ploidy = ploidy.loc[(wildcards.sample), "ploidy"]
-    return {str(ploidy)}
+    sample_id = str(wildcards.sample)
+    if sample_id not in _ploidy_by_sample:
+        raise ValueError(
+            f"No ploidy found for sample={sample_id}. Ensure METAFILE has columns 'sample' and 'ploidy'."
+        )
+    return _ploidy_by_sample[sample_id]
 
-### interval functions
-# Define naming scheme for GATK's scattered intervals and bed files.
-##############################################################################
 
-# Create the intervals directory if it doesn't exist
-os.makedirs(INTERVALS_DIR, exist_ok=True)
+os.makedirs(HC_INTERVALS_DIR, exist_ok=True)
+os.makedirs(JOINT_INTERVALS_DIR, exist_ok=True)
+
 
 def scattered_interval_name(i):
-    """Return e.g. '0000-scattered.interval_list' for i=0."""
     return f"{i:04d}-scattered.interval_list"
 
-def scattered_bed_name(i):
-    """Return the corresponding bed name, e.g. '0000-scattered.bed'."""
-    return f"{i:04d}-scattered.bed"
 
-SCATTERED_INTERVAL_LISTS = [
-    os.path.join(INTERVALS_DIR, scattered_interval_name(i))
-    for i in range(SCATTER_COUNT)
+HC_SCATTERED_INTERVAL_LISTS = [
+    os.path.join(HC_INTERVALS_DIR, scattered_interval_name(i))
+    for i in range(HC_SCATTER_COUNT)
 ]
-# SCATTERED_BED_FILES = [
-#    os.path.join(INTERVALS_DIR, scattered_bed_name(i))
-#    for i in range(SCATTER_COUNT)
-#]
+
+JOINT_SCATTERED_INTERVAL_LISTS = [
+    os.path.join(JOINT_INTERVALS_DIR, scattered_interval_name(i))
+    for i in range(JOINT_SCATTER_COUNT)
+]
+
 
 rule end:
     input:
         "sample_map.txt",
-        expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz",sample=sample),
-        expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz.tbi",sample=sample),
+        expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz", sample=sample),
+        expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz.tbi", sample=sample),
         final_path + "/gatk4/final_vcf/raw.vcf.gz",
         final_path + "/gatk4/final_vcf/raw.vcf.gz.tbi"
 
-        # final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
-        # final_path + "/gatk4/final_vcf/af_filtered.stats.txt",
-        # final_path + "/gatk4/final_vcf/multiqc_report.html"
-        
 
 rule CreateDict:
     input:
@@ -108,53 +288,58 @@ rule CreateDict:
         gatk CreateSequenceDictionary -R {input} -O {output}
         """
 
+
 rule WriteSampleMap:
     input:
         config["METAFILE"]
     output:
         "sample_map.txt"
     run:
-        import pandas as pd
-        sam = pd.read_csv(config["METAFILE"],sep='\t').set_index(["sample"], drop=False)
-        sam['gvcf']= [final_path + "/gatk4/gvcf/" +y+ ".g.vcf.gz" for y in sam.index]
-        fsam = sam[['sample','gvcf']].drop_duplicates()
-        fsam.to_csv(path_or_buf="sample_map.txt",columns=['sample','gvcf'],sep='\t',index=False,header=False)
+        sam = pd.read_csv(config["METAFILE"], sep='\t').set_index(["sample"], drop=False)
+        sam['gvcf'] = [final_path + "/gatk4/gvcf/" + sample_id + ".g.vcf.gz" for sample_id in sam.index]
+        fsam = sam[['sample', 'gvcf']].drop_duplicates()
+        fsam.to_csv(path_or_buf="sample_map.txt", columns=['sample', 'gvcf'], sep='\t', index=False, header=False)
+
 
 rule haplotypecaller:
     input:
-        bam=final_path + "/dedup/{sample}.bam",
-        bai=final_path + "/dedup/{sample}.bam.bai",
+        bam=ANALYSIS_BAM_PATTERN,
+        bai=ANALYSIS_BAI_PATTERN,
         reference=GENOME,
-        dict_genome=GENOME.rstrip(".fasta") + ".dict"
+        dict_genome=GENOME.rstrip(".fasta") + ".dict",
+        intervals_list=lambda wc: HC_SCATTERED_INTERVAL_LISTS if HC_SCATTER_MODE == "interval" else []
     output:
-        vcf=temp(final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz"),
-        vcfidx=temp(final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz.tbi")
+        vcf=temp(final_path + "/gatk4/gvcf/scattered/{scatter_id}/{sample}.g.vcf.gz"),
+        vcfidx=temp(final_path + "/gatk4/gvcf/scattered/{scatter_id}/{sample}.g.vcf.gz.tbi")
     benchmark:
-        "benchmarks/haplotypecaller/haplotypecaller_{sample}_{scaffold}.txt"
+        "benchmarks/haplotypecaller/haplotypecaller_{sample}_{scatter_id}.txt"
     threads:
-        4
+        HC_THREADS
     resources:
-        mem_mb = 8000,
-        time = "3-0",
+        mem_mb=HC_MEM_MB,
+        time=HC_TIME,
         sample=1
     params:
-        outputpath = final_path + "/gatk4/gvcf",
-        stand_call_conf = config["HaplotypeCaller"]["minConfidenceForVariantCalling"],
-        ploidy = get_ploidy,
-    resources:
-        mem_mb = 8000,
-        sample=1
+        stand_call_conf=config["HaplotypeCaller"]["minConfidenceForVariantCalling"],
+        ploidy=get_ploidy,
+        region_args=hc_region_args_for_scatter,
+        java_xms=str(HC_CFG["java_xms"]),
+        java_xmx=str(HC_CFG["java_xmx"])
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         """
-        # --do-not-run-physical-phasing  since it will later contradict with het pol genotypes https://github.com/AndersenLab/wi-gatk/pull/24/commits/ea7c64eb69bd0ecf75602ef646cc7a0fb7f82a83
-        gatk --java-options "-Xms6G -Xmx6G -XX:ConcGCThreads={threads}" HaplotypeCaller \
+        REGION_ARG="{params.region_args}"
+
+        mkdir -p $(dirname {output.vcf})
+        mkdir -p {TMPDIR}
+
+        gatk --java-options "-Xms{params.java_xms} -Xmx{params.java_xmx} -XX:ConcGCThreads={threads} -Djava.io.tmpdir={TMPDIR}" HaplotypeCaller \
             --emit-ref-confidence GVCF \
             -R {input.reference} \
             -I {input.bam} \
             -O {output.vcf} \
-            -L {wildcards.scaffold} \
+            $REGION_ARG \
             -ploidy {params.ploidy} \
             --annotation ChromosomeCounts \
             --annotation Coverage \
@@ -173,15 +358,22 @@ rule haplotypecaller:
             --annotation-group AS_StandardAnnotation \
             --annotation-group StandardHCAnnotation \
             --pcr-indel-model NONE \
-            --all-site-pls 
-            #--standard-min-confidence-threshold-for-calling {params.stand_call_conf} 
-
+            --all-site-pls
         """
+
 
 rule mergeSampleGvcfs:
     input:
-        expand(final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz", sample=sample, scaffold=scaffolds),
-        expand(final_path + "/gatk4/gvcf/{scaffold}_{sample}.g.vcf.gz.tbi", sample=sample, scaffold=scaffolds)
+        vcfs=lambda wc: expand(
+            final_path + "/gatk4/gvcf/scattered/{scatter_id}/{sample}.g.vcf.gz",
+            sample=wc.sample,
+            scatter_id=HC_SCATTER_UNITS,
+        ),
+        vcfs_idx=lambda wc: expand(
+            final_path + "/gatk4/gvcf/scattered/{scatter_id}/{sample}.g.vcf.gz.tbi",
+            sample=wc.sample,
+            scatter_id=HC_SCATTER_UNITS,
+        )
     output:
         final_path + "/gatk4/gvcf/{sample}.g.vcf.gz",
         final_path + "/gatk4/gvcf/{sample}.g.vcf.gz.tbi"
@@ -190,183 +382,208 @@ rule mergeSampleGvcfs:
     threads:
         4
     resources:
-        mem_mb = 8000
+        mem_mb=8000
     params:
-        outputpath = final_path + "/gatk4/gvcf/"
+        outputpath=final_path + "/gatk4/gvcf/",
+        scatterpath=final_path + "/gatk4/gvcf/scattered/"
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         """
-        awk '{{ print "{params.outputpath}" $0 "_{wildcards.sample}.g.vcf.gz" }}' scaffolds.list > {params.outputpath}{wildcards.sample}_gvcfs.list
-        bcftools concat  -O z --file-list {params.outputpath}{wildcards.sample}_gvcfs.list > {output[0]}
+        awk '{{ print "{params.scatterpath}" $0 "/{wildcards.sample}.g.vcf.gz" }}' hc_scatter_units.list > {params.outputpath}{wildcards.sample}_gvcfs.list
+        bcftools concat -O z --file-list {params.outputpath}{wildcards.sample}_gvcfs.list > {output[0]}
         bcftools index --tbi {output[0]}
         """
 
-# Determine scatter units (chromosome or interval)
-def get_scatter_units():
-    if SCATTER_MODE == "chromosome":
-        return scaffolds
-    elif SCATTER_MODE == "interval":
-        return [f"{i:04d}-scattered" for i in range(SCATTER_COUNT)]
-    else:
-        return []
 
-SCATTER_UNITS = get_scatter_units()
-# write SCATTER_UNITS to a file
-with open("scatter_units.list", "w") as f:
-    f.write("\n".join(SCATTER_UNITS))
-
-
-
-rule scatter_intervals_by_ns:
-    """
-    Scatter intervals across the reference genome's Ns using GATK ScatterIntervalsByNs.
-    If SCATTER_MODE != 'interval', just create an empty file.
-    """
+rule hc_scatter_intervals_by_ns:
     input:
         reference=GENOME,
         dict_genome=GENOME.rstrip(".fasta") + ".dict"
     output:
-        intervals_list=os.path.join(INTERVALS_DIR, "scattered.interval_list")
+        intervals_list=os.path.join(HC_INTERVALS_DIR, "scattered.interval_list")
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         r"""
-        if [ "{SCATTER_MODE}" = "interval" ]; then
+        if [ "{HC_SCATTER_MODE}" = "interval" ]; then
             set -e
-            echo "Starting ScatterIntervalsByNs" 
             gatk ScatterIntervalsByNs \
                 -R {input.reference} \
                 --MAX_TO_MERGE 199 \
-                -O {output.intervals_list} 
-            echo "Finished ScatterIntervalsByNs"
+                -O {output.intervals_list}
         else
-            # If not interval mode, produce an empty intervals file
             touch {output.intervals_list}
         fi
         """
 
-rule split_intervals:
-    """
-    Split intervals into SCATTER_COUNT parts using GATK SplitIntervals,
-    then 
-    convert each .interval_list => .bed - no need to do this since we are using the .interval_list extension directly
-    """
+
+rule hc_split_intervals:
     input:
-        intervals_list=os.path.join(INTERVALS_DIR, "scattered.interval_list"),
+        intervals_list=os.path.join(HC_INTERVALS_DIR, "scattered.interval_list"),
         reference=GENOME
     output:
-        # Mark these scattered intervals and bed files as temp so they can be removed after usage
-        interval_lists=SCATTERED_INTERVAL_LISTS
+        interval_lists=HC_SCATTERED_INTERVAL_LISTS
     params:
-        scatter_count=SCATTER_COUNT
+        scatter_count=HC_SCATTER_COUNT,
+        intervals_dir=HC_INTERVALS_DIR
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         r"""
-        if [ "{SCATTER_MODE}" = "interval" ]; then
+        if [ "{HC_SCATTER_MODE}" = "interval" ]; then
             set -e
-            echo "Starting SplitIntervals" 
             gatk SplitIntervals \
                 -R {input.reference} \
                 -L {input.intervals_list} \
                 --scatter-count {params.scatter_count} \
-                -O {INTERVALS_DIR} 
-            echo "Finished SplitIntervals" 
+                -O {params.intervals_dir}
         else
-            # Not scattering => create empty placeholders
-            for i in $(seq 0 $(( {{params.scatter_count}} - 1 ))); do
-                touch {INTERVALS_DIR}/$(printf "%04d-scattered.interval_list" $i)
+            for i in $(seq 0 $(( {params.scatter_count} - 1 ))); do
+                touch {params.intervals_dir}/$(printf "%04d-scattered.interval_list" $i)
             done
         fi
         """
 
-rule GenomicsDBImport:
+
+rule joint_scatter_intervals_by_ns:
     input:
-        sample_map="sample_map.txt",
-        vcfs=expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz", sample=sample),
-        intervals_list=SCATTERED_INTERVAL_LISTS
+        reference=GENOME,
+        dict_genome=GENOME.rstrip(".fasta") + ".dict"
     output:
-        temp(directory(final_path + "/gatk4/genomicsDB/{scatter_id}.db"))
-    benchmark:
-        "benchmarks/GenomicsDBImport/GenomicsDBImport_{scatter_id}.txt"
-    threads:
-        20
-    resources:
-        mem_mb = 20000
-    params:
-        outputpath = final_path + "/gatk4/genomicsDB"
+        intervals_list=os.path.join(JOINT_INTERVALS_DIR, "scattered.interval_list")
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         r"""
-        set -e
-        echo "Starting GenomicsDBImport" 
-        REGION_ARG=""
-        if [ "{SCATTER_MODE}" = "chromosome" ]; then
-            REGION_ARG="-L {wildcards.scatter_id}"
-        elif [ "{SCATTER_MODE}" = "interval" ]; then
-            REGION_ARG="-L {INTERVALS_DIR}/{wildcards.scatter_id}.interval_list"
+        if [ "{JOINT_SCATTER_MODE}" = "interval" ]; then
+            set -e
+            gatk ScatterIntervalsByNs \
+                -R {input.reference} \
+                --MAX_TO_MERGE 199 \
+                -O {output.intervals_list}
+        else
+            touch {output.intervals_list}
         fi
-        gatk --java-options "-Xms6G -Xmx6G -XX:ConcGCThreads={threads}" GenomicsDBImport \
-            --genomicsdb-workspace-path {output[0]} \
-            $REGION_ARG \
-            --sample-name-map sample_map.txt \
-            --reader-threads {threads} \
-            --batch-size 16 
         """
+
+
+rule joint_split_intervals:
+    input:
+        intervals_list=os.path.join(JOINT_INTERVALS_DIR, "scattered.interval_list"),
+        reference=GENOME
+    output:
+        interval_lists=JOINT_SCATTERED_INTERVAL_LISTS
+    params:
+        scatter_count=JOINT_SCATTER_COUNT,
+        intervals_dir=JOINT_INTERVALS_DIR
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        r"""
+        if [ "{JOINT_SCATTER_MODE}" = "interval" ]; then
+            set -e
+            gatk SplitIntervals \
+                -R {input.reference} \
+                -L {input.intervals_list} \
+                --scatter-count {params.scatter_count} \
+                -O {params.intervals_dir}
+        else
+            for i in $(seq 0 $(( {params.scatter_count} - 1 ))); do
+                touch {params.intervals_dir}/$(printf "%04d-scattered.interval_list" $i)
+            done
+        fi
+        """
+
 
 rule GenotypeGVCFs:
     input:
-        db=final_path + "/gatk4/genomicsDB/{scatter_id}.db",
+        sample_map="sample_map.txt",
+        vcfs=expand(final_path + "/gatk4/gvcf/{sample}.g.vcf.gz", sample=sample),
         reference=GENOME,
-        intervals_list=SCATTERED_INTERVAL_LISTS
+        intervals_list=lambda wc: JOINT_SCATTERED_INTERVAL_LISTS if JOINT_SCATTER_MODE == "interval" else []
     output:
         temp(final_path + "/gatk4/vcf/{scatter_id}.vcf.gz"),
         temp(final_path + "/gatk4/vcf/{scatter_id}.vcf.gz.tbi")
     benchmark:
         "benchmarks/GenotypeGVCFs/GenotypeGVCFs_{scatter_id}.txt"
     threads:
-        20
+        COMBINED_GGVCF_THREADS
     resources:
-        mem_mb = 100000,
-        time = "3-0"
+        mem_mb=COMBINED_GGVCF_MEM_MB,
+        time=GGVCF_TIME
     params:
-        outputpath = final_path + "/gatk4/vcf",
-        stand_call_conf = config["GenotypeGVCFs"]["minConfidenceForVariantCalling"]
+        stand_call_conf=config["GenotypeGVCFs"]["minConfidenceForVariantCalling"],
+        region_args=joint_region_args_for_scatter,
+        gdbi_threads=GDBI_THREADS,
+        gdbi_java_xms=str(GDBI_CFG["java_xms"]),
+        gdbi_java_xmx=str(GDBI_CFG["java_xmx"]),
+        gdbi_batch_size=int(GDBI_CFG["batch_size"]),
+        gdbi_interval_padding=int(GDBI_CFG["interval_padding"]),
+        gdbi_merge_input_intervals=bool(GDBI_CFG.get("merge_input_intervals", True)),
+        ggvcf_threads=GGVCF_THREADS,
+        ggvcf_java_heap_mb=int(
+            GGVCF_CFG["java_heap_mb"]
+            if GGVCF_CFG.get("java_heap_mb") not in [None, "", "null"]
+            else max(1024, int(GGVCF_MEM_MB * 0.75))
+        ),
+        ggvcf_max_alternate_alleles=int(GGVCF_CFG["max_alternate_alleles"]),
+        ggvcf_only_output_calls_starting_in_intervals=bool(
+            GGVCF_CFG.get("only_output_calls_starting_in_intervals", True)
+        )
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         r"""
         set -e
-        echo "Starting GenomicsDBImport" 
-        REGION_ARG=""
-        if [ "{SCATTER_MODE}" = "chromosome" ]; then
-            REGION_ARG="-L {wildcards.scatter_id}"
-        elif [ "{SCATTER_MODE}" = "interval" ]; then
-            REGION_ARG="-L {INTERVALS_DIR}/{wildcards.scatter_id}.interval_list"
+        mkdir -p {TMPDIR}
+        REGION_ARG="{params.region_args}"
+        MERGE_INPUT_INTERVALS=""
+        ONLY_OUTPUT_CALLS=""
+
+        if [ "{params.gdbi_merge_input_intervals}" = "True" ]; then
+            MERGE_INPUT_INTERVALS="--merge-input-intervals"
         fi
 
-        gatk --java-options "-Xms80G -Xmx80G -XX:ConcGCThreads={threads} -XX:ParallelGCThreads={threads} -Djava.io.tmpdir={resources.tmpdir}" GenotypeGVCFs \
+        if [ "{params.ggvcf_only_output_calls_starting_in_intervals}" = "True" ]; then
+            ONLY_OUTPUT_CALLS="--only-output-calls-starting-in-intervals"
+        fi
+
+        scratch_base="$(mktemp -d "{TMPDIR}/genomicsdb_{wildcards.scatter_id}.XXXXXX")"
+        dbdir="$scratch_base/workspace"
+        trap 'rm -rf "$scratch_base"' EXIT
+
+        gatk --java-options "-Xms{params.gdbi_java_xms} -Xmx{params.gdbi_java_xmx} -XX:ConcGCThreads={params.gdbi_threads} -Djava.io.tmpdir={TMPDIR}" GenomicsDBImport \
+            --genomicsdb-workspace-path "$dbdir" \
+            $REGION_ARG \
+            --sample-name-map {input.sample_map} \
+            --reader-threads {params.gdbi_threads} \
+            $MERGE_INPUT_INTERVALS \
+            --batch-size {params.gdbi_batch_size} \
+            --interval-padding {params.gdbi_interval_padding}
+
+        gatk --java-options "-Xms{params.ggvcf_java_heap_mb}M -Xmx{params.ggvcf_java_heap_mb}M -XX:ConcGCThreads={params.ggvcf_threads} -XX:ParallelGCThreads={params.ggvcf_threads} -Djava.io.tmpdir={TMPDIR}" GenotypeGVCFs \
             -R {input.reference} \
-            -V gendb://{input.db} \
+            -V "gendb://$dbdir" \
             -G StandardAnnotation \
             -G AS_StandardAnnotation \
             -G StandardHCAnnotation \
             -G AlleleSpecificAnnotation \
             -all-sites \
-            -max-alternate-alleles 10 \
+            $ONLY_OUTPUT_CALLS \
+            -max-alternate-alleles {params.ggvcf_max_alternate_alleles} \
             -O {output[0]} \
             --verbosity DEBUG \
-            --tmp-dir {resources.tmpdir} \
+            --tmp-dir {TMPDIR} \
             --standard-min-confidence-threshold-for-calling {params.stand_call_conf} \
-            $REGION_ARG 
-
+            $REGION_ARG
         """
+
 
 rule ConcatVCFs:
     input:
-        expand(final_path + "/gatk4/vcf/{scatter_id}.vcf.gz", scatter_id=SCATTER_UNITS)
+        expand(final_path + "/gatk4/vcf/{scatter_id}.vcf.gz", scatter_id=JOINT_SCATTER_UNITS),
+        expand(final_path + "/gatk4/vcf/{scatter_id}.vcf.gz.tbi", scatter_id=JOINT_SCATTER_UNITS)
     output:
         final_path + "/gatk4/final_vcf/raw.vcf.gz",
         final_path + "/gatk4/final_vcf/raw.vcf.gz.tbi"
@@ -374,21 +591,15 @@ rule ConcatVCFs:
         "benchmarks/ConcatVCFs/ConcatVCFs.txt"
     threads:
         4
-    resources: 
-        mem_mb = 8000
+    resources:
+        mem_mb=8000
     params:
-        inputpath = final_path + "/gatk4/vcf/"
+        inputpath=final_path + "/gatk4/vcf/"
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
         """
-        awk '{{ print "{params.inputpath}" $0 ".vcf.gz" }}' scatter_units.list > {params.inputpath}contig_set.tsv
-        bcftools concat  -O z --file-list {params.inputpath}contig_set.tsv > {output[0]}
+        awk '{{ print "{params.inputpath}" $0 ".vcf.gz" }}' joint_scatter_units.list > {params.inputpath}contig_set.tsv
+        bcftools concat -O z --file-list {params.inputpath}contig_set.tsv > {output[0]}
         bcftools index --tbi {output[0]}
         """
-
-
-
-
-
-

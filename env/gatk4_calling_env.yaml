@@ -11,3 +11,5 @@ dependencies:
     - vcflib=1.0.3
     - multiqc
     - r-base
+    - bioconductor-snprelate
+    - r-argparse

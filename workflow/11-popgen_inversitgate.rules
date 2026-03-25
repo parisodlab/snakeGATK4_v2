@@ -1,0 +1,322 @@
+# Snakemake rules for population-genetics follow-up analyses
+# - prepares mapping files from metadata and an (unrooted) Newick tree
+# - runs Dsuite (Dtrios -> Fbranch -> Dinvestigate), TreeMix, windowed PCA and TWISST
+#
+# Usage notes:
+# - Provide keys in your Snakemake `config.yaml` under `popgen_investigate`:
+#     metadata: path/to/metadata.tsv     # must contain sampleID and population columns
+#     vcf:      path/to/input.vcf.gz      # bcf/vcf with sample IDs matching metadata
+#     tree:     path/to/unrooted.tree     # unrooted Newick tree (tip names must match sampleIDs)
+#     outdir:   results/popgen_investigate
+#     threads:  4                         # default threads
+# - The rules call external tools (Dsuite, TreeMix, iqtree/raxml/fasttree, python scripts). Adjust commands
+#   to the locations on your system (or use conda/singularity wrappers in the `shell` directives).
+import pandas as pd
+import os
+import sys
+import itertools
+
+configfile: "config_main.yaml"
+
+cfg = config.get('popgen_investigate', {})
+METAFILE = config.get('METAFILE')
+TREE     = cfg.get('tree', 'tree_unrooted.nwk')
+OUTDIR   = config["FINALOUTPUT"]+"/"+config["PROJECT"]+"/popgen_investigate"
+OUTGROUPS  = cfg.get('outgroups', None)
+VCF      = cfg.get('vcf', config["FINALOUTPUT"]+"/"+config["PROJECT"]+"/variants/filtered_variants.vcf.gz")
+
+# create metadata, read metafile, subset on sample, pop, ploidy
+# write metadata with only sample, pop columns for tools that need it
+def write_metadata(file):
+    outmeta = os.path.dirname(OUTDIR)+"/metadata"
+    os.makedirs(outmeta, exist_ok=True)
+    outmetafile = outmeta+"/sample2pop.tsv"
+    df = pd.read_csv(file, sep="\t", dtype=str)
+    if 'sample' not in df.columns or 'pop' not in df.columns:
+        sys.exit("Error: metadata file must contain 'sample' and 'pop' columns.")
+    df = df[['sample', 'pop','ploidy']].dropna()
+    # deduplicate
+    df = df.drop_duplicates(subset=['sample'])
+    # ensure sample IDs are unique
+    if df['sample'].duplicated().any():
+        sys.exit("Error: duplicate sample IDs found in metadata.")
+    df[['sample','pop']].to_csv(outmetafile, sep="\t", index=False, header=True)
+    return outmeta+"/sample2pop.tsv"
+
+METADATA=write_metadata(METAFILE)
+
+rule all:
+    input:
+        # summary targets: adjust as you add/enable analyses
+        f"{OUTDIR}/dsuite/analysis_Dmin.txt"
+        # f"{OUTDIR}/dsuite/fbranch.txt",
+        # f"{OUTDIR}/dinvestigate/dinvestigate_windows.txt",
+        # f"{OUTDIR}/treemix/treemix_model.gz",
+        # f"{OUTDIR}/twisst/twisst_weights.tsv",
+        # f"{OUTDIR}/pca/windowed_pca_parquet"  # directory placeholder
+
+# ---------------------------------------------------------------------------
+# Basic preparation: extract sample->population mapping file used by many tools
+# metadata must be a tab-separated table with header containing at least: sampleID, population
+# Output format: two-column plain text: sampleID\tpopulation
+rule prepare_dsuite_sets:
+    output:
+        groups = f"{OUTDIR}/metadata/sample2set.tsv"
+    params:
+        outgroups = ",".join(OUTGROUPS or []),
+        metadata = METADATA
+    shell:
+        """
+        awk -v OG="{params.outgroups}" '
+        BEGIN{{
+            FS=OFS="\t";
+            n=split(OG,arr,",");
+            for(i=1;i<=n;i++){{ g=arr[i]; pats[i]=g }}
+        }}
+        NR==1{{
+            for(i=1;i<=NF;i++) h[$i]=i;
+            sidx = (h["sample"]?h["sample"]:(h["sampleID"]?h["sampleID"]:0));
+            pidx = (h["pop"]?h["pop"]:(h["population"]?h["population"]:(h["species"]?h["species"]:0)));
+            if(!sidx||!pidx){{ print "ERROR: metadata missing sample/pop columns" > "/dev/stderr"; exit 1 }}
+            next
+        }}
+        {{
+            s=$sidx; p=$pidx; out=p;
+            for(i=1;i<=n;i++){{ if(pats[i]!="" && s ~ ("^"pats[i])){{ out="Outgroup"; break }} }}
+            print s, out
+        }}' {params.metadata} > {output.groups}
+        """
+
+# Get unrooted tree, root it on samples that start with the letters in OUTGROUP 
+rule root_tree:
+    input:
+        tree=TREE # unrooted tree
+    output:
+        tree=f"{OUTDIR}/dsuite/rooted_tree.nwk"  # rooted tree
+    params:
+        outgroups=OUTGROUPS
+    conda: "../env/make_nj_tree.yaml"
+    shell:
+        r"""
+        Rscript -e '
+        library(ape);
+        # Load tree
+        tree <- read.tree("{input.tree}");
+        # Parse outgroup letters from params
+        letters <- unlist(strsplit("{params.outgroups}", ","));
+        # Select outgroup tips
+        outgroup <- grep(paste0("^(", paste(letters, collapse="|"), ")"), tree$tip.label, value = TRUE);
+        print(paste("Outgroup samples for rooting:", paste(outgroup, collapse=", ")));
+        # Root at outgroup
+        rooted_tree <- root(tree, outgroup = outgroup, resolve.root = TRUE);
+        # Write tree
+        write.tree(rooted_tree, file="{output.tree}");
+        '
+        """
+
+# ---------------------------------------------------------------------------
+# Dsuite: Dtrios (run Dsuite to compute D-statistics across trios)
+# requires: Dsuite in PATH. Adjust command if using conda/singularity.
+rule dsuite_dtrios:
+    input:
+        vcf = VCF,
+        groups = rules.prepare_dsuite_sets.output.groups,
+        tree = rules.root_tree.output.tree
+    output:
+        dtrios = f"{OUTDIR}/dsuite/analysis_Dmin.txt",
+        bbaa   = f"{OUTDIR}/dsuite/analysis_BBAA.txt"
+    params:
+        outdir = f"{OUTDIR}/dsuite",
+        prefix = "analysis"
+    threads: 4
+    shell:
+        """
+        # Example: Dsuite Dtrios -c -o <prefix> <vcf> <groups>
+        # -c : use genotype calls (if applicable). Remove or change flags for your VCF.
+        ../scripts/Dsuite/Build/Dsuite Dtrios -c -o {params.outdir}/{params.prefix} {input.vcf} {input.groups}
+        # Dsuite produces several files; move/rename expected outputs
+        """
+
+# # ---------------------------------------------------------------------------
+# # Compute Fbranch from Dsuite BBAA output and the tree
+# # Fbranch usually takes the species tree and the BBAA file; see Dsuite docs for exact invocation
+# rule dsuite_fbranch:
+#     input:
+#         tree = rules.prepare_tree.output.tree_copy,
+#         bbaa = rules.dsuite_dtrios.output.bbaa
+#     output:
+#         fbranch = f"{OUTDIR}/dsuite/fbranch.txt"
+#     params:
+#         out = f"{OUTDIR}/dsuite/fbranch.txt"
+#     conda: "workflow/envs/dsuite.yaml"
+#     shell:
+#         """
+#         mkdir -p $(dirname {params.out})
+#         # Example invocation (DSuite v0.5+): Dsuite Fbranch <tree> <BBAA_file> > fbranch.txt
+#         Dsuite Fbranch {input.tree} {input.bbaa} > {params.out}
+#         mv {params.out} {output.fbranch}
+#         """
+
+# # ---------------------------------------------------------------------------
+# # Dinvestigate: sliding-window investigation of D-statistics for specific trios
+# # This rule demonstrates running Dinvestigate for one trio; you can expand via expand/wildcards
+# rule dsuite_dinvestigate:
+#     input:
+#         vcf = VCF,
+#         groups = rules.prepare_dsuite_groups.output.groups,
+#         dtrios = rules.dsuite_dtrios.output.dtrios
+#     output:
+#         dinv = f"{OUTDIR}/dinvestigate/dinvestigate_windows.txt"
+#     params:
+#         outdir = f"{OUTDIR}/dinvestigate",
+#         window = 50000,
+#         step = 10000
+#     threads: THREADS
+#     conda: "workflow/envs/dsuite.yaml"
+#     shell:
+#         """
+#         mkdir -p {params.outdir}
+#         # Dinvestigate syntax (example): Dsuite Dinvestigate -w <window_size>,<step_size> <vcf> <trio-file>
+#         # We will run Dinvestigate for all trios listed in the Dtrios output (adapt as needed)
+#         Dsuite Dinvestigate -w {params.window},{params.step} {input.vcf} {input.dtrios} > {output.dinv}
+#         """
+
+# # ---------------------------------------------------------------------------
+# # TreeMix: build population graph using allele counts per population
+# # We need to prepare allele-counts per population (e.g., using bcftools + custom script)
+# rule prepare_treemix_input:
+#     input:
+#         vcf = VCF,
+#         groups = rules.prepare_dsuite_groups.output.groups
+#     output:
+#         treemix_input = f"{OUTDIR}/treemix/treemix_input.txt.gz"
+#     params:
+#         tmp = f"{OUTDIR}/treemix/tmp"
+#     conda: "workflow/envs/bcftools.yaml"
+#     shell:
+#         """
+#         mkdir -p $(dirname {output.treemix_input}) {params.tmp}
+#         groups_file={input.groups}
+#         vcf={input.vcf}
+#         samples_list={params.tmp}/samples.list
+#         # get sample order from VCF
+#         bcftools query -l $vcf > $samples_list
+
+#         # produce per-site genotype matrix (CHROM POS [GT per sample])
+#         # then aggregate genotypes into allele counts per population and write Treemix input
+#         bcftools query -f '%CHROM\t%POS[\t%GT]\n' $vcf \
+#         | awk -v sampfile=$samples_list -v popfile=$groups_file -F"\t" 'BEGIN{ OFS="\t";
+#             # read sample list
+#             ns=0; while((getline s < sampfile)>0){ ns++; samples[ns]=s }
+#             # map samples to populations and build pop list in order of first appearance
+#             np=0; while((getline < popfile)>0){ split($0,a,"\t"); samp=a[1]; pop=a[2]; sample2pop[samp]=pop; if(!(pop in popseen)){ popseen[pop]=1; pops[++np]=pop } }
+#         }
+#         {
+#             chrom=$1; pos=$2;
+#             # initialize counts per pop
+#             for(i=1;i<=np;i++){ ref[i]=0; alt[i]=0 }
+#             # iterate genotypes (fields 3..NF) matching samples[1..ns]
+#             for(i=3;i<=NF;i++){
+#                 gt=$i
+#                 sidx=i-2; samp=samples[sidx]
+#                 pop=sample2pop[samp]
+#                 if(pop=="" || pop==".") { pop="_missing_" }
+#                 # convert genotype to allele counts (assume diploid numeric alleles 0/1)
+#                 if(gt=="./." || gt==".") { r=0; a=0 }
+#                 else {
+#                     g=gt; gsub("[|/]"," ",g); split(g,ga," "); r=0; a=0;
+#                     for(k in ga){ if(ga[k]=="0") r+=1; else if(ga[k]=="1") a+=1 }
+#                 }
+#                 # find pop index
+#                 for(pidx=1;pidx<=np;pidx++) if(pops[pidx]==pop) { ref[pidx]+=r; alt[pidx]+=a; break }
+#             }
+#             # print site and counts as pop1_ref,pop1_alt pop2_ref,pop2_alt ... (no header)
+#             printf "%s:%s", chrom, pos
+#             for(pidx=1;pidx<=np;pidx++) printf "\t%d,%d", ref[pidx], alt[pidx]
+#             printf "\n"
+#         }' > {params.tmp}/treemix_input.txt
+
+#         gzip -c {params.tmp}/treemix_input.txt > {output.treemix_input}
+#         rm -r {params.tmp}
+#         """
+
+# rule treemix_run:
+#     input:
+#         treemix = rules.prepare_treemix_input.output.treemix_input
+#     output:
+#         model = f"{OUTDIR}/treemix/treemix_model.gz"
+#     params:
+#         outdir = f"{OUTDIR}/treemix",
+#         m = 3
+#     threads: THREADS
+#     conda: "workflow/envs/treemix.yaml"
+#     shell:
+#         """
+#         mkdir -p {params.outdir}
+#         # Example TreeMix call; replace with the correct path to treemix if needed
+#         # treemix -i {input.treemix} -o {params.outdir}/treemix_model -m {params.m} -k 500 -noss
+#         # Here we create a placeholder gz to mark completion
+#         echo "treemix run placeholder" | gzip -c > {output.model}
+#         """
+
+# # ---------------------------------------------------------------------------
+# # Windowed PCA (per-window PCA) - write results into a directory in parquet/feather or plain TSV
+# # This rule is a template: replace the python command with your windowed-PCA implementation.
+# rule windowed_pca:
+#     input:
+#         vcf = VCF,
+#         groups = rules.prepare_dsuite_groups.output.groups
+#     output:
+#         dir = directory(f"{OUTDIR}/pca")
+#     params:
+#         window = 50000,
+#         step = 25000
+#     threads: THREADS
+#     conda: "workflow/envs/python-data.yaml"
+#     shell:
+#         """
+#         mkdir -p {output.dir}
+#         # Call a Python script that performs per-window PCA and writes results to {output.dir}
+#         # Example (user-supplied script): scripts/windowed_pca.py --vcf {input.vcf} --groups {input.groups} --window {params.window} --step {params.step} --out {output.dir}
+#         echo "windowed PCA placeholder" > {output.dir}/windowed_pca_done.txt
+#         """
+
+# # ---------------------------------------------------------------------------
+# # TWISST: compute topology weights across windows
+# # - requires windowed trees (one tree per window). This rule assumes you have such trees in a directory.
+# rule twisst_run:
+#     input:
+#         trees_dir = f"{OUTDIR}/twisst/trees"
+#     output:
+#         weights = f"{OUTDIR}/twisst/twisst_weights.tsv"
+#     params:
+#         outdir = f"{OUTDIR}/twisst"
+#     conda: "workflow/envs/python-data.yaml"
+#     shell:
+#         """
+#         mkdir -p {params.outdir}
+#         # Example TWISST invocation (pythonic):
+#         # twisst.py --trees {input.trees_dir} --labels samples.txt --output {output.weights}
+#         echo "twisst weights placeholder" > {output.weights}
+#         """
+
+# # ---------------------------------------------------------------------------
+# # Helpful rule: summarise AMOVA and other scalar outputs into a single human-readable report
+# rule report_summary:
+#     input:
+#         fbranch = rules.dsuite_fbranch.output.fbranch,
+#         dinv = rules.dsuite_dinvestigate.output.dinv
+#     output:
+#         report = f"{OUTDIR}/report/popgen_investigate_summary.txt"
+#     shell:
+#         """
+#         mkdir -p $(dirname {output.report})
+#         echo "Popgen investigation summary" > {output.report}
+#         echo "---------------------------" >> {output.report}
+#         echo "\nFbranch (first 40 lines):" >> {output.report}
+#         head -n 40 {input.fbranch} >> {output.report}
+#         echo "\nDinvestigate (first 40 lines):" >> {output.report}
+#         head -n 40 {input.dinv} >> {output.report}
+#         """
+
+# # End of rules file

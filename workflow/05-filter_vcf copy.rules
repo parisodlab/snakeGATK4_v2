@@ -9,50 +9,6 @@ final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
 
 sample=samples["sample"]
 
-# Immediately write unique sample-pop pairs to data/sample_pop_unique.tsv (no Snakemake rule)
-POP_COL = None
-if 'pop' in samples.columns:
-    POP_COL = 'pop'
-elif 'population' in samples.columns:
-    POP_COL = 'population'
-
-if POP_COL is None:
-    raise ValueError("Metadata file does not contain 'pop' or 'population' column. Cannot write data/sample_pop_unique.tsv")
-
-out_fp = os.path.join('data','sample_pop_unique.tsv')
-os.makedirs(os.path.dirname(out_fp), exist_ok=True)
-df = samples.reset_index(drop=True)[['sample', POP_COL]].drop_duplicates()
-df.columns = ['sample','pop']
-df.to_csv(out_fp, sep='\t', index=False, header=False)
-
-
-# Immediately write unique sample-ploidy pairs to data/sample_pop_unique.tsv (no Snakemake rule)
-POP_COL = None
-if 'ploidy' in samples.columns:
-    POP_COL = 'ploidy'
-
-if POP_COL is None:
-    raise ValueError("Metadata file does not contain 'ploidy' column. Cannot write data/sample_ploidy_unique.tsv")
-
-out_fp_ploidy = os.path.join('data','sample_ploidy_unique.tsv')
-os.makedirs(os.path.dirname(out_fp_ploidy), exist_ok=True)
-df = samples.reset_index(drop=True)[['sample', POP_COL]].drop_duplicates()
-df.columns = ['sample','ploidy']
-# make ploidy as string
-df['ploidy'] = df['ploidy'].astype(str)
-# 2: diploid, 4: tetraploid
-df['ploidy'] = df['ploidy'].replace({'2': 'diploid', '4': 'tetraploid'})
-df.to_csv(out_fp_ploidy, sep='\t', index=False, header=False)
-
-# write another file specifying colchitetra, if samples end with "CT"
-ct_rows = df[df['sample'].str.endswith("CT")].copy()
-if not ct_rows.empty:
-    out_fp_ploidy_ct = os.path.join('data','sample_ploidy_unique_colchitetra.tsv')
-    ct_rows['ploidy'] = "colchitetraploid"
-    os.makedirs(os.path.dirname(out_fp_ploidy_ct), exist_ok=True)
-    ct_rows.to_csv(out_fp_ploidy_ct, sep='\t', index=False, header=False)
-
-
 GENOME = config["GENOME"]
 
 samples_ploidy = samples["ploidy"].to_dict()
@@ -67,39 +23,6 @@ ploidy_dp = {
 }
 
 
-# --- depth/het mask integration variables -----------------------------------
-# Paths: point at the project's final VCF and create dedicated depth_masks and logs
-VCF_FILTERED = final_path + "/gatk4/final_vcf"
-VCF_MERGED = VCF_FILTERED + "/filtered.vcf.gz"
-DEPTHMASK_DIR = final_path + "/gatk4/depth_masks"
-LOG_DIR = final_path + "/gatk4/logs"
-
-# Resource and parameter defaults (can be overridden in config under RESOURCES)
-make_depth_mask_mem_mb = config.get('RESOURCES', {}).get('make_depth_mask_mem_mb', 4000)
-make_depth_mask_runtime = config.get('RESOURCES', {}).get('make_depth_mask_runtime', '3600')
-TOTAL_SAMPLES = len(sample)
-DEPTHMASK_N = config.get('DEPTHMASK_N', max(1, int(round(0.2 * TOTAL_SAMPLES))))
-
-# default minimum per-sample depth to consider when computing means/std
-# fallback to the smallest per-ploidy min depth declared in config, or 1
-MIN_DEPTH_DEFAULT = min([v['min'] for v in ploidy_dp.values()]) if len(ploidy_dp) > 0 else 1
-DEPTHMASK_MIN_DEPTH = config.get('DEPTHMASK_MIN_DEPTH', MIN_DEPTH_DEFAULT)
-
-# Het-mask related defaults
-ANNOTATION = config.get('ANNOTATION', '')
-HET_MISSING = config.get('HET_MISSING', 0.33)
-
-
-# discover all metadata files named like data/sample_*.tsv
-import glob
-SAMPLE_META_FILES = sorted(glob.glob("data/sample_*.tsv"))
-if len(SAMPLE_META_FILES) == 0:
-    raise ValueError("No files matching data/sample_*.tsv found")
-
-# ids used as wildcards: sample_<id>.tsv -> id
-GROUP_IDS = [Path(f).stem.replace("sample_", "") for f in SAMPLE_META_FILES]
-
-
 rule end:
     input:
         final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz",
@@ -107,24 +30,9 @@ rule end:
         final_path + "/gatk4/final_vcf/multiqc_report.html",
         final_path + "/gatk4/final_vcf/dp_distribution_numgeno.pdf",
         final_path + "/gatk4/final_vcf/dp_distribution_numsites.pdf",
-        final_path + "/gatk4/final_vcf/indel_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/indel_filtered.stats.txt",
-        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.stats.txt",
-        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.mean_dp_per_sample.tsv",
-        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/missingness_filtered.stats.txt",
-        final_path + "/gatk4/final_vcf/missingness_filtered.mean_dp_per_sample.tsv",
-        final_path + "/gatk4/final_vcf/mean_dp_per_sample_qc.tsv",
-        final_path + "/gatk4/final_vcf/filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/filtered.stats.txt",
-        DEPTHMASK_DIR + "/make_depth_mask.ok",
-        expand(DEPTHMASK_DIR + "/merged_het_{group_id}.tsv", group_id=GROUP_IDS),
-        expand(VCF_FILTERED + "/plots/{group_id}/pairwise.ok", group_id=GROUP_IDS),
-        expand(VCF_FILTERED + "/plots/{group_id}/per_gene.ok", group_id=GROUP_IDS),
-        expand(VCF_FILTERED + "/plots/{group_id}/mean_per_gene.ok", group_id=GROUP_IDS)
-
-
+        final_path + "/gatk4/final_vcf/biallelic_indel_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/biallelic_indel_filtered.stats.txt"
+        
 rule GeneratePloidyLists:
     output:
         diploid = "data/diploids.list",
@@ -409,6 +317,7 @@ rule combine_dp:
         final_path + "/gatk4/final_vcf/combined_dp_filtered.tsv"
     run:
         import pandas as pd
+
         all_dp = []
         for file in input.dp_files:
             sample = file.split('/')[-1].replace('_dp.txt','')
@@ -422,6 +331,7 @@ rule combine_dp:
             df['NumSites'] = df['NumSites'].astype(int)
             df['Sample'] = sample
             all_dp.append(df)
+
         df_all = pd.concat(all_dp, ignore_index=True)
         df_all.to_csv(output[0], sep='\t', index=False)
 
@@ -559,89 +469,9 @@ rule Filter_missingness:
         bcftools stats -s- --threads {threads} --verbose {params.outputpath}missingness_filtered.vcf.gz > {params.outputpath}missingness_filtered.stats.txt
         """
 
-
-rule mean_dp_missingness_per_sample:
-    input:
-        vcf=rules.Filter_missingness.output[0]
-    output:
-        tsv=final_path + "/gatk4/final_vcf/missingness_filtered.mean_dp_per_sample.tsv"
-    conda:
-        "../env/python-data.yaml"
-    params:
-        label="missingness_filtered"
-    script:
-        "../scripts/mean_dp_per_sample_from_vcf.py"
-
-
 rule filter_BIALLELIC_SNP:
-    """
-    Select biallelic SNPs from the missingness-filtered VCF and produce a
-    bgzipped VCF, its index, and bcftools statistics.
-    """
-    input:
-        vcf = final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz"
-    output:
-        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.vcf.gz.tbi",
-        final_path + "/gatk4/final_vcf/biallelic_snp_filtered.stats.txt"
-    threads:
-        30
-    resources:
-        mem_mb = 8000,
-        time = "2-00:00"
-    params:
-        outputpath = final_path + "/gatk4/final_vcf/"
-    conda:
-        "../env/gatk4_calling_env.yaml"
-    shell:
-        r"""
-        # select only SNPs and require exactly two alleles (biallelic)
-        bcftools view --threads {threads} -v snps -m2 -M2 {input.vcf} -Oz -o {output[0]}
-        bcftools index --tbi {output[0]}
-        bcftools stats --threads {threads} -s- --verbose {output[0]} > {output[2]}
-        """
+    # New indel filtering pipeline implemented as multiple small rules below.
 
-
-rule mean_dp_biallelic_snp_per_sample:
-    input:
-        vcf=rules.filter_BIALLELIC_SNP.output[0]
-    output:
-        tsv=final_path + "/gatk4/final_vcf/biallelic_snp_filtered.mean_dp_per_sample.tsv"
-    conda:
-        "../env/python-data.yaml"
-    params:
-        label="biallelic_snp_filtered"
-    script:
-        "../scripts/mean_dp_per_sample_from_vcf.py"
-
-
-rule combine_mean_dp_per_sample_qc:
-    input:
-        missingness=rules.mean_dp_missingness_per_sample.output.tsv,
-        biallelic=rules.mean_dp_biallelic_snp_per_sample.output.tsv
-    output:
-        final_path + "/gatk4/final_vcf/mean_dp_per_sample_qc.tsv"
-    run:
-        missing_df = pd.read_csv(input.missingness, sep='\t').rename(
-            columns={
-                'mean_dp': 'mean_dp_missingness_snp',
-                'sites_with_dp': 'sites_with_dp_missingness_snp',
-                'fraction_sites_with_dp': 'fraction_sites_with_dp_missingness_snp',
-            }
-        )
-        biallelic_df = pd.read_csv(input.biallelic, sep='\t').rename(
-            columns={
-                'mean_dp': 'mean_dp_biallelic_snp',
-                'sites_with_dp': 'sites_with_dp_biallelic_snp',
-                'fraction_sites_with_dp': 'fraction_sites_with_dp_biallelic_snp',
-            }
-        )
-        merged = missing_df.drop(columns=['vcf_label']).merge(
-            biallelic_df.drop(columns=['vcf_label']),
-            on='sample',
-            how='outer'
-        )
-        merged.to_csv(output[0], sep='\t', index=False)
 
 rule select_indels:
     input:
@@ -659,7 +489,7 @@ rule select_indels:
         """
         bcftools view -v indels --threads {threads} -Oz -o {output.indels} {input.vcf}
         bcftools index --tbi {output.indels}
-        bcftools stats -s- --threads {threads} --verbose {output.indels} > {output.stats}
+        bcftools stat -s- --threads {threads} --verbose {output.indels} > {output.stats}
         """
 
 
@@ -711,16 +541,30 @@ rule compute_mean_coverage:
     output:
         final_path + "/gatk4/final_vcf/mean_coverage.txt"
     params:
-        coverage_vcf = final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz"
+        coverage_vcf = config.get('INDEL', {}).get('coverage_vcf', final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz")
     threads:
         2
-    resources:
-        mem_mb = 50000,
-        time = "1-00:00"
     conda:
         "../env/gatk4_calling_env.yaml"
-    script:
-        "../scripts/compute_mean_coverage.py"
+    run:
+        import subprocess
+        import math
+        vcf = params.coverage_vcf
+        cmd = f"bcftools query -f '%INFO/DP\n' -i 'INFO/DP>0' {vcf}"
+        proc = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        vals = []
+        for line in proc.stdout:
+            line=line.strip()
+            if line=='' or line=='.':
+                continue
+            try:
+                vals.append(float(line))
+            except:
+                continue
+        proc.stdout.close(); proc.wait()
+        mean = sum(vals)/len(vals) if len(vals)>0 else 0
+        with open(output[0],'w') as out:
+            out.write(str(mean)+"\n")
 
 
 rule filter_indels_strict:
@@ -728,11 +572,11 @@ rule filter_indels_strict:
     Produces the final indel VCF and stats.
     """
     input:
-        dp_masked=rules.mask_low_support_genotypes_indels.output.dp_masked,
+        dp_masked=rules.mask_low_support_genotypes.output.dp_masked,
         mean_cov=rules.compute_mean_coverage.output[0]
     output:
-        final_path + "/gatk4/final_vcf/indel_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/indel_filtered.stats.txt"
+        final_path + "/gatk4/final_vcf/biallelic_indel_filtered.vcf.gz",
+        final_path + "/gatk4/final_vcf/biallelic_indel_filtered.stats.txt"
     threads:
         16
     resources:
@@ -751,8 +595,55 @@ rule filter_indels_strict:
         max_len = 20
     conda:
         "../env/gatk4_calling_env.yaml"
-    script:
-        "../scripts/filter_indels_strict.py"
+    run:
+        import os
+        import tempfile
+        import subprocess
+
+        # read mean coverage
+        mean = 0.0
+        mean_fp = input.mean_cov if isinstance(input.mean_cov, str) else input[1]
+        with open(mean_fp) as m:
+            txt = m.read().strip()
+            mean = float(txt) if txt not in ('', '\n') else 0.0
+
+        max_depth = float(params.excess_mult) * mean
+
+        tmp = tempfile.mkdtemp()
+        tmp_v = os.path.join(tmp, 'indels_filtered_site.vcf.gz')
+
+        # Build bcftools include expression
+        expr = (
+            f"INFO/FS <= {params.FS} && INFO/SOR <= {params.SOR} && INFO/MQ >= {params.MQ} && "
+            f"INFO/MQRankSum >= {params.MQRankSum} && INFO/QD >= {params.QD} && INFO/ReadPosRankSum >= {params.ReadPosRankSum} && "
+            f"INFO/DP <= {max_depth}"
+        )
+
+        # run bcftools view with the expression
+        subprocess.run([
+            'bcftools', 'view', '-i', expr, '--threads', str(threads), '-Oz', '-o', tmp_v, input.dp_masked
+        ], check=True)
+        subprocess.run(['bcftools', 'index', '--tbi', tmp_v], check=True)
+
+        # write header and body (filtered by indel absolute length)
+        hdr = os.path.join(tmp, 'hdr.vcf')
+        body = os.path.join(tmp, 'body.vcf')
+
+        subprocess.run(f"bcftools view -h {tmp_v} > {hdr}", shell=True, check=True)
+
+        # awk: for each ALT (comma-separated) compute |len(REF)-len(ALT)| and keep record if any ALT has len <= max_len
+        awk = (
+            r"awk 'BEGIN{FS="\t"} {n=split($5,a,\",\"); for(i=1;i<=n;i++){alt=a[i]; d=length($4)-length(alt); if(d<0)d=-d; if(d<=%d){print; break}} }'"
+            % int(params.max_len)
+        )
+        subprocess.run(f"bcftools view -H {tmp_v} | {awk} > {body}", shell=True, check=True)
+
+        # concatenate header and body, bgzip and index
+        subprocess.run(f"cat {hdr} {body} | bgzip -c > {output[0]}", shell=True, check=True)
+        subprocess.run(['bcftools', 'index', '--tbi', output[0]], check=True)
+        subprocess.run(f"bcftools stats -s- --threads {threads} --verbose {output[0]} > {output[1]}", shell=True, check=True)
+
+        subprocess.run(['rm', '-rf', tmp], check=True)
 
 
 rule FilterVCFminAF:
@@ -842,159 +733,6 @@ rule LD_pruning:
         bcftools stats -s- --threads {threads} --verbose {params.outputpath}4_fold_degenerate_filtered.ld_pruned.vcf.gz > {params.outputpath}4_fold_degenerate_filtered.ld_pruned.stats.txt
         """
 
-
-
-		
-rule make_depth_mask:
-    """
-    Compute depth-based mask files from the merged VCF produced by
-    MergeVariantAndInvariant. Outputs use fixed 'merged' prefixes.
-    """
-    input:
-        merged = final_path + "/gatk4/final_vcf/filtered.vcf.gz",
-        script = "scripts/make_depth_mask.py"
-    output:
-        touch(DEPTHMASK_DIR + "/make_depth_mask.ok")
-        # depth_out = DEPTHMASK_DIR + "/merged_dm_out.tsv",
-        # depth_counts = DEPTHMASK_DIR + "/merged_dm_counts.tsv",
-        # depth_hist = DEPTHMASK_DIR + "/merged_dm_hist.tsv",
-        # depth_bed = DEPTHMASK_DIR + "/merged_dm.bed",
-        # stats = DEPTHMASK_DIR + "/merged_dm_counts_out.tsv.sample_depth_stats.txt",
-        # summary = DEPTHMASK_DIR + "/merged_dm_counts_out.tsv.sample_mean_sd.tsv"
-    resources:
-        mem_mb = 200000,
-        time = "4-00:00"
-    threads: 2
-    conda:
-        "../env/make_depth_mask_env.yaml"
-    log:
-        LOG_DIR + "/make_depth_mask.log"
-    params:
-        outputpath = DEPTHMASK_DIR
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {DEPTHMASK_DIR}
-        # estimate variant sites
-        if [ -s "{input.merged}" ]; then
-            n_loci=$(zcat {input.merged} | grep -c "^[^#]" || true)
-        else
-            n_loci=1000000
-        fi
-
-        PYTHONUNBUFFERED=1 python3 -u {input.script} \
-            -v {input.merged} \
-            -o {params.outputpath}/out_file_dm.tsv \
-            -c {params.outputpath}/counts_out.tsv \
-            -p {params.outputpath}/hist_out.tsv \
-            -n {DEPTHMASK_N} \
-            -l $n_loci \
-            -m {DEPTHMASK_MIN_DEPTH} \
-            --stats {params.outputpath}/counts_out.tsv.sample_depth_stats.txt \
-            --summary {params.outputpath}/counts_out.tsv.sample_mean_sd.tsv \
-            --bed out_file_merged.bed 
-
-        """
-
-
-# --- het mask rule ---------------------------------------------------------
-# Uses the provided scripts/make_het_mask.py to compute per-site heterozygosity
-# and write a BED of sites to DEPTHMASK_DIR/merged_hetmask.bed
-
-
-rule make_het_mask:
-    input:
-        merged = final_path + "/gatk4/final_vcf/filtered.vcf.gz",
-        samples = lambda wc: f"data/sample_{wc.group_id}.tsv",
-        annotation = ANNOTATION,
-        script = "scripts/make_het_mask_new.py"
-    output:
-        het_tsv = DEPTHMASK_DIR + "/merged_het_{group_id}.tsv"
-    threads: 1
-    resources:
-        mem_mb = 200000,
-        time = "1-00:00"
-    log:
-        LOG_DIR + "/make_het_mask.{group_id}.log"
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {DEPTHMASK_DIR}
-
-        # run het mask generator; missing threshold HET_MISSING (default 0.33)
-        PYTHONUNBUFFERED=1 python3 -u {input.script} -v {input.merged} -o out_het.tsv -s {input.samples} -a {input.annotation} -m {HET_MISSING} 2>&1 | tee {log}
-
-        # # expected output: contig, start, end, ...; convert to bed of sites
-        # awk '{{print $1"\t"$2"\t"$3}}' out_het.tsv > out_het.bed
-        # bedops -m out_het.bed > out_het_merged.bed
-
-        mv out_het.tsv {output.het_tsv}
-        """
-
-
-rule plot_pairwise:
-    input:
-        het_tsv = DEPTHMASK_DIR + "/merged_het_{group_id}.tsv",
-        script = "scripts/make_pairwise_plots.py"
-    output:
-        touch = VCF_FILTERED + "/plots/{group_id}/pairwise.ok"
-    threads: 1
-    log:
-        LOG_DIR + "/plot_pairwise.{group_id}.log"
-    params:
-        group_id = lambda wc: wc.group_id
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {VCF_FILTERED}/{params.group_id}/plots
-        mkdir -p {LOG_DIR}
-        python3 {input.script} {input.het_tsv} {VCF_FILTERED}/{params.group_id}/plots merged &>> {log}
-        touch {output.touch}
-        """
-
-
-rule plot_per_gene:
-    input:
-        het_tsv = DEPTHMASK_DIR + "/merged_het_{group_id}.tsv",
-        script = "scripts/make_per_gene_plots.py"
-    output:
-        touch = VCF_FILTERED + "/plots/{group_id}/per_gene.ok"
-    threads: 1
-    log:
-        LOG_DIR + "/plot_per_gene.{group_id}.log"
-    params:
-        group_id = lambda wc: wc.group_id
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {VCF_FILTERED}/{params.group_id}/plots
-        mkdir -p {LOG_DIR}
-        python3 {input.script} {input.het_tsv} {VCF_FILTERED}/{params.group_id}/plots merged &>> {log}
-        touch {output.touch}
-        """
-
-
-rule plot_mean:
-    input:
-        het_tsv = DEPTHMASK_DIR + "/merged_het_{group_id}.tsv",
-        script = "scripts/make_mean_per_gene_plots.py"
-    output:
-        touch = VCF_FILTERED + "/plots/{group_id}/mean_per_gene.ok"
-    threads: 1
-    log:
-        LOG_DIR + "/plot_mean.{group_id}.log"
-    params:
-        group_id = lambda wildcards: wildcards.group_id
-    shell:
-        r"""
-        set -euo pipefail
-        mkdir -p {VCF_FILTERED}/{params.group_id}/plots
-        mkdir -p {LOG_DIR}
-        python3 {input.script} {input.het_tsv} {VCF_FILTERED}/{params.group_id}/plots merged &>> {log}
-        touch {output.touch}
-        """
-
-
 rule MultiQC:
     input:
         final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz"
@@ -1009,3 +747,128 @@ rule MultiQC:
         multiqc {params.outputpath} -o {params.outputpath}
         """
 
+
+
+		
+rule make_depth_mask:
+	"""
+	Compute depth-based mask files from merged VCF using the project's
+	helper script. This rule uses a temporary working directory for small
+	intermediate files but does not copy the large merged VCF.
+	"""
+	input:
+		merged = VCF_FILTERED + "/{species}.merged.vcf.gz",
+		script = "scripts/make_depth_mask.py"
+	output:
+			depth_out = DEPTHMASK_DIR + "/{species}_dm_out.tsv",
+			depth_counts = DEPTHMASK_DIR + "/{species}_dm_counts.tsv",
+			depth_hist = DEPTHMASK_DIR + "/{species}_dm_hist.tsv",
+			depth_bed = DEPTHMASK_DIR + "/{species}_dm.bed"
+	resources:
+		mem_mb = make_depth_mask_mem_mb,
+		runtime = make_depth_mask_runtime
+	log:
+		LOG_DIR + "/make_depth_mask_{species}.log"
+	shell:
+		r"""
+		set -euo pipefail
+		# Count variant sites (fast stream, no full copy)
+		n_loci=$(zcat {input.merged} | grep -c "^[^#]")
+
+		python3 make_depth_mask.py -v {input.merged} -o out_file.tsv -c counts_out.tsv -p hist_out.tsv -n {DEPTHMASK_N} -l $n_loci &>> {log}
+
+		awk '{{print $1"\t"($2 - 1)"\t"$2}}' out_file.tsv > out_file.bed
+		bedops -m out_file.bed > out_file_merged.bed
+
+		mv out_file.tsv {output.depth_out}
+		mv counts_out.tsv {output.depth_counts}
+		mv hist_out.tsv {output.depth_hist}
+		mv out_file_merged.bed {output.depth_bed}
+		"""
+
+
+# --- het mask rule ---------------------------------------------------------
+# Uses the provided scripts/make_het_mask.py to compute per-site heterozygosity
+# and write a BED of sites (per-species) to DEPTHMASK_DIR/{species}_hetmask.bed
+rule make_het_mask:
+	input:
+		merged = VCF_FILTERED + "/{species}.merged.vcf.gz",
+		samples = SAMPLES_FILE,
+		annotation = ANNOTATION,
+		script = "scripts/make_het_mask.py"
+	output:
+		het_bed = DEPTHMASK_DIR + "/{species}_hetmask.bed",
+		het_tsv = DEPTHMASK_DIR + "/{species}_het.tsv"
+	threads: 1
+	resources:
+		mem_mb = make_depth_mask_mem_mb,
+		runtime = make_depth_mask_runtime
+	log:
+		LOG_DIR + "/make_het_mask_{species}.log"
+	shell:
+		r"""
+
+		# run het mask generator; missing threshold HET_MISSING (default 0.33)
+	python3 make_het_mask.py -v {input.merged} -o out_het.tsv -s {input.samples} -a {input.annotation} -m {HET_MISSING} &>> {log}
+
+		# expected output: contig, start, end, ...; convert to bed of sites
+		awk '{{print $1"\t"$2"\t"$3}}' out_het.tsv > out_het.bed
+		bedops -m out_het.bed > out_het_merged.bed
+
+		mv out_het_merged.bed {output.het_bed}
+		mv out_het.tsv {output.het_tsv}
+		"""
+
+
+rule plot_pairwise:
+	input:
+		het_tsv = DEPTHMASK_DIR + "/{species}_het.tsv",
+		script = "scripts/make_pairwise_plots.py"
+	output:
+		touch = VCF_FILTERED + "/plots/{species}.pairwise.ok"
+	threads: 1
+	log:
+		LOG_DIR + "/plot_pairwise_{species}.log"
+	shell:
+		r"""
+		set -euo pipefail
+		mkdir -p {VCF_FILTERED}/plots
+	python3 {input.script} {input.het_tsv} {VCF_FILTERED}/plots {wildcards.species} &>> {log}
+		touch {output.touch}
+		"""
+
+
+rule plot_per_gene:
+	input:
+		het_tsv = DEPTHMASK_DIR + "/{species}_het.tsv",
+		script = "scripts/make_per_gene_plots.py"
+	output:
+		touch = VCF_FILTERED + "/plots/{species}.per_gene.ok"
+	threads: 1
+	log:
+		LOG_DIR + "/plot_per_gene_{species}.log"
+	shell:
+		r"""
+		set -euo pipefail
+		mkdir -p {VCF_FILTERED}/plots
+	python3 {input.script} {input.het_tsv} {VCF_FILTERED}/plots {wildcards.species} &>> {log}
+		touch {output.touch}
+		"""
+
+
+rule plot_mean:
+	input:
+		het_tsv = DEPTHMASK_DIR + "/{species}_het.tsv",
+		script = "scripts/make_mean_per_gene_plots.py"
+	output:
+		touch = VCF_FILTERED + "/plots/{species}.mean_per_gene.ok"
+	threads: 1
+	log:
+		LOG_DIR + "/plot_mean_{species}.log"
+	shell:
+		r"""
+		set -euo pipefail
+		mkdir -p {VCF_FILTERED}/plots
+	python3 {input.script} {input.het_tsv} {VCF_FILTERED}/plots {wildcards.species} &>> {log}
+		touch {output.touch}
+		"""

@@ -1,0 +1,11 @@
+name: dsuite
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - dsuite
+  - r-base
+  - bcftools
+  - tabix
+  - python

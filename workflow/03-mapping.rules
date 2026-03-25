@@ -8,6 +8,16 @@ temp_path = "results" + "/" + config["PROJECT"]
 sample=samples["sample"]
 prefix=samples["prefix"]
 
+# Sequencing type affects whether duplicate marking/removal is appropriate.
+# - wgs: run MarkDuplicates and use BAMs in /dedup downstream
+# - ddrad: skip MarkDuplicates and use BAMs in /merged_samples downstream
+SEQTYPE = str(config.get("SEQTYPE", "wgs")).strip().lower()
+if SEQTYPE not in {"wgs", "ddrad"}:
+    raise ValueError(f"Invalid SEQTYPE={SEQTYPE!r}. Expected 'wgs' or 'ddrad'.")
+ANALYSIS_BAM_SUBDIR = "merged_samples" if SEQTYPE == "ddrad" else "dedup"
+ANALYSIS_BAM_PATTERN = final_path + f"/{ANALYSIS_BAM_SUBDIR}/{{sample}}.bam"
+ANALYSIS_BAI_PATTERN = final_path + f"/{ANALYSIS_BAM_SUBDIR}/{{sample}}.bam.bai"
+
 wildcard_constraints:
     prefix = "|".join(samples.index),
     sample = "|".join(samples["sample"])
@@ -46,7 +56,8 @@ def get_read_group(wildcards):
 rule end:
     input:
         report1 = final_path + "/bamcoverage/multiqc_report.html",
-        report2 = expand(final_path + "/coverage/bamcov/{sample}_coverage.txt",sample=sample)
+        report2 = expand(final_path + "/coverage/bamcov/{sample}_coverage.txt",sample=sample),
+        bam = expand(ANALYSIS_BAM_PATTERN, sample=sample)
 
 
 
@@ -80,6 +91,7 @@ rule mapping:
 	
         """
 
+
 rule MergeBamLanes:
     input:
         bamin = lambda wildcards: expand( final_path + "/mapped/{unit}.bam",unit=dunits[wildcards.sample]["prefix"])
@@ -93,10 +105,17 @@ rule MergeBamLanes:
         sample=4
     threads: 12
     params:
-        inbam= lambda wildcards, input: " ".join(input.bamin)
+        inbam= lambda wildcards, input: " ".join(input.bamin),
+        n_bams=lambda wildcards, input: len(input.bamin),
+        single_bam=lambda wildcards, input: input.bamin[0]
     shell:
         """
-        sambamba merge --nthreads={threads} --show-progress {output.out} {params.inbam}
+        set -e
+        if [ {params.n_bams} -eq 1 ]; then
+            cp -f {params.single_bam} {output.out}
+        else
+            sambamba merge --nthreads={threads} --show-progress {output.out} {params.inbam}
+        fi
         sambamba index --nthreads={threads} {output.out}
         """
 
@@ -130,7 +149,7 @@ rule MarkDuplicates:
 
 rule CoverageReport:
     input:
-        bam=final_path + "/dedup/{sample}.bam"
+        bam=ANALYSIS_BAM_PATTERN
     output:
         summ=final_path + "/coverage/{sample}_summaryStats.txt",
         bamtools=final_path + "/coverage/{sample}_bamtools_stats.txt"
@@ -154,7 +173,7 @@ rule CoverageReport:
 
 rule genomeCov:
     input:
-        final_path + "/dedup/{sample}.bam"
+        ANALYSIS_BAM_PATTERN
     output:
         final_path + "/coverage/bamcov/{sample}_coverage.txt"
     benchmark:
@@ -169,7 +188,7 @@ rule genomeCov:
 
 rule deeptoolsCov:
     input:
-        final_path + "/dedup/{sample}.bam"
+        ANALYSIS_BAM_PATTERN
     output:
         final_path + "/bamcoverage/deeptools/{sample}_coverage.pdf"
     benchmark:
@@ -191,7 +210,7 @@ rule deeptoolsCov:
 
 rule goleftCov:
     input:
-        expand(final_path + "/dedup/{sample}.bam",sample=sample)
+        expand(ANALYSIS_BAM_PATTERN,sample=sample)
     output:
         ped=final_path + "/bamcoverage/goleft/report/report-indexcov.ped",
         roc=final_path + "/bamcoverage/goleft/report/report-indexcov.roc",
@@ -199,7 +218,7 @@ rule goleftCov:
     log:
         "indexcov.log",
     params:
-        inbam=final_path + "/dedup/"
+        inbam=final_path + f"/{ANALYSIS_BAM_SUBDIR}/"
     conda:
         "../env/bamcoverage.yaml"
     shell:
@@ -209,7 +228,7 @@ rule goleftCov:
 
 rule samtoolsStats:
     input:
-        final_path + "/dedup/{sample}.bam"
+        ANALYSIS_BAM_PATTERN
     output:
         stat=final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",
         idxstat=final_path + "/bamcoverage/samtools/{sample}_samtools_idxstats.txt",

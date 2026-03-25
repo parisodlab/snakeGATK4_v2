@@ -1,15 +1,18 @@
 import pandas as pd
 import os
-configfile: "config.yaml"
+configfile: "config_main.yaml"
 
 
 GENOME = config["GENOME"]
-GENOME_GFF= config["GENOME_GFF"]
-final_path=config["final_output"] 
+GENOME_GFF= config["ANNOTATION"]
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+METAFILE= config["METAFILE"]
 
 rule all:
     input:
-        final_path + "/degeneracy/degeneracy-fourfold.bed"
+        final_path + "/degeneracy/degeneracy-fourfold.bed",
+        final_path + "/degeneracy/degeneracy-zerofold.bed",
+        final_path + "/phylogeny/nj_tree.pdf"
 
 rule degeneracy_annotation:
     input:
@@ -53,3 +56,44 @@ rule degenerate_site_fourfold:
                 # Keep the row only if column 5 equals '4'
                 if len(cols) >= 5 and cols[4] == '4':
                     out.write(line)
+
+rule degenerate_site_zerofold:
+    input:
+        bed=final_path + "/degeneracy/degeneracy-all-sites.bed"
+    output:
+        final_path + "/degeneracy/degeneracy-zerofold.bed"
+    benchmark:
+        "benchmarks/vcf_annotation/degeneracy_zerofold.bed"
+    threads:
+        4
+    params:
+        outputpath=final_path + "/degeneracy/"
+    resources:
+        mem_mb = 8000,
+        time = "3-0"
+    run:
+        with open(input[0]) as f, open(output[0], "w") as out:
+            for line in f:
+                cols = line.strip().split("\t")
+                # Keep the row only if column 5 equals '0'
+                if len(cols) >= 5 and cols[4] == '0':
+                    out.write(line)
+
+rule make_nj_tree:
+    input:
+        vcf= final_path + "/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz",
+        metadata= METAFILE
+    output:
+        final_path + "/phylogeny/nj_tree.pdf"
+    benchmark: 
+        "benchmarks/vcf_annotation/nj_tree.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 16000,
+        time = "2-0"
+    conda: "../env/make_nj_tree.yaml"
+    shell:
+        """
+        Rscript ../scripts/make_nj_tree.R {input.vcf} {input.metadata} {output}
+        """

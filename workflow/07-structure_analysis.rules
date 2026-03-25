@@ -7,8 +7,10 @@ import pandas as pd
 configfile: "config_main.yaml"
 
 
-final_path = config["FINALOUTPUT"] + config["PROJECT"]
+final_path = config["FINALOUTPUT"]+"/"+config["PROJECT"]
 logs_path = config["log_folder"]
+
+print("Final output path:", final_path)
 
 
 rule all:
@@ -27,79 +29,6 @@ KS     = config["Structure"]["ks"]
 REPS   = config["Structure"]["replicates"]
 BURNIN = config["Structure"]["burnin"]
 MCMC   = config["Structure"]["mcmc"]
-
-
-
-rule Filter_missingness:
-    input:
-        vcf=final_path + "/gatk4/final_vcf/filtered.vcf.gz",
-        tbi=final_path + "/gatk4/final_vcf/filtered.vcf.gz.tbi"
-    output:
-        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/missingness_filtered.stats.txt",
-        final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz.tbi"
-    benchmark:
-        "benchmarks/FilterVCFminAF_and_missingness/Filter_missingness.txt"
-    threads:
-        4
-    resources:
-        mem_mb = 8000
-    params:
-        outputpath = final_path + "/gatk4/final_vcf/"
-    conda:
-        "../env/gatk4_calling_env.yaml"
-    shell:
-        """
-        bcftools view --threads {threads} -O v -i 'F_MISSING <= 0.5'  {input[0]} |\
-            vcffixup - | \
-            bcftools view --threads {threads} -O z > {params.outputpath}missingness_filtered.vcf.gz
-        bcftools index {params.outputpath}missingness_filtered.vcf.gz
-        bcftools stats -s- --threads {threads} --verbose {params.outputpath}missingness_filtered.vcf.gz > {params.outputpath}missingness_filtered.stats.txt
-        """
-
-
-rule FilterVCFminAF:
-    input:
-        vcf=final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz",
-        tbi=final_path + "/gatk4/final_vcf/missingness_filtered.vcf.gz.tbi"
-    output:
-        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz",
-        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz.tbi",
-        final_path + "/gatk4/final_vcf/af_filtered.stats.txt"
-    benchmark:
-        "benchmarks/FilterVCFminAF_and_missingness/FilterVCFminAF.txt"
-    threads:
-        4
-    resources:
-        mem_mb = 8000
-    params:
-        outputpath = final_path + "/gatk4/final_vcf/"
-    conda:
-        "../env/gatk4_calling_env.yaml"
-    shell:
-        """
-        bcftools view --threads {threads} -O v --min-af 0.03 --max-af 0.97 {input[0]} |\
-            vcffixup - | \
-            bcftools view --threads {threads} -O z > {params.outputpath}af_filtered.vcf.gz
-        bcftools index {params.outputpath}af_filtered.vcf.gz
-        bcftools stats -s- --threads {threads} --verbose {params.outputpath}af_filtered.vcf.gz > {params.outputpath}af_filtered.stats.txt
-        """
-
-
-rule MultiQC:
-    input:
-        final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"
-    output:
-        final_path + "/gatk4/final_vcf/multiqc_report.html"
-    conda:
-        "../env/gatk4_calling_env.yaml"
-    params:
-        outputpath = final_path + "/gatk4/final_vcf/"
-    shell:
-        """
-        multiqc {params.outputpath} -o {params.outputpath}
-        """
-
         
 rule count_vcf_stats:
     input:
@@ -248,12 +177,12 @@ rule run_structure:
         final_path + "/structure/results/K{K}_rep{r}_f"
     conda:
         "../env/structure_env.yaml"
-    resources:
-        time= config["Structure"]["time"]  # Use time from config
     params:
         outdir=lambda wc: f"{final_path}/structure/results",
         outfile=lambda wc: f"K{wc.K}_rep{wc.r}",
         seed=lambda wc: str(abs(hash(f'{wc.K}_{wc.r}')) % 10**6)
+    resources:
+        time=config["Structure"]["time"]  # Use time from config
     shell:
         """
         N=$(cat {input.inds}); L=$(cat {input.loci})
@@ -284,7 +213,8 @@ rule structure_harvester:
     shell:
         """
         mkdir -p {params.outdir}
-        structureHarvester.py --dir={params.indir} --out={params.outdir} --evanno --clumpp
+        STRUCTUREHARVESTER=$(which structureHarvester.py)
+        python2 $STRUCTUREHARVESTER --dir={params.indir} --out={params.outdir} --evanno --clumpp
 
         # parse best K from evanno.txt: column 1 = K, column 4 = Delta K
         awk 'NR>1 {{if($4>max){{max=$4;best=$1}}}} END {{print best}}' {output.evanno} > {output.bestK}
@@ -300,7 +230,8 @@ rule clumpp:
         params:
             outdir = final_path + "/structure/clumpp/",
             harvester_output = final_path + "/structure/harvester_output",
-            params_clumpp = "data/structure/clumpp_params/paramfile"
+            params_clumpp = "data/structure/clumpp_params/paramfile",
+            ks = " ".join(str(k) for k in KS)
         conda:
             "../env/structure_env.yaml"
         shell:
@@ -312,24 +243,16 @@ rule clumpp:
             cd {params.outdir}
             
 
-            if [ "{MODE}" = "bestK" ]; then
-                K=$(cat $basedir/{params.harvester_output}/bestK.txt)
-                cp $basedir/{params.harvester_output}/K$K.indfile .
-                echo "Running CLUMPP at best K = $K"
-                outfile=$basedir/{params.outdir}/clumpp_output_$K.txt
-                CLUMPP -k $K -r {REPS} -c $inds \
-                    -i K$K.indfile \
-                    -o $outfile -j $basedir/{params.outdir}/K$K.MISCFILE
-            else
-                K={KS}
+            for K in {params.ks}; do
                 echo "Running CLUMPP at fixed K = $K"
+                cp $basedir/{params.harvester_output}/K$K.indfile .
                 outfile=$basedir/{params.outdir}/clumpp_output_$K.txt
                 CLUMPP -k $K -r {REPS} -c $inds \
                     -i K$K.indfile \
                     -o $outfile -j $basedir/{params.outdir}/K$K.MISCFILE
-            fi
-            python $basedir/scripts/plot_clumpp.py \
-                $outfile $basedir/{input.structure} $outfile.pdf $K
+                python $basedir/scripts/plot_clumpp.py \
+                    $outfile $basedir/{input.structure} $outfile.pdf $K
+            done
             """
         
 
@@ -338,7 +261,7 @@ rule glpca_diploid:
         vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
         metadata=config["METAFILE"]
     output:
-        pdf="results/pca/pca_diploid.pdf"
+        pdf=final_path +"/pca/pca_diploid.pdf"
     conda:
         "../env/pca.yaml"
     shell:
@@ -424,7 +347,7 @@ rule glpca_tetraploid:
         vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
         metadata=config["METAFILE"]
     output:
-        pdf="results/pca/pca_tetraploid.pdf"
+        pdf=final_path + "/pca/pca_tetraploid.pdf"
     conda:
         "../env/pca.yaml"
     shell:
@@ -514,7 +437,7 @@ rule mixedploidy_pca:
         vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
         metadata=config["METAFILE"]
     output:
-        pdf=final_path + "/pca/pca_" + config["PCA"]["ploidy"] + ".pdf"
+        pdf=final_path + "/pca/pca_mixed.pdf"
     conda:
         "../env/pca.yaml"   # same environment as diploid PCA, with ggplot2, viridis, ggrepel, cowplot etc.
     shell:

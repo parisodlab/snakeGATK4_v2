@@ -6,15 +6,20 @@ Clean BED-based piawka rules:
 """
 
 import os
-configfile: "config.yaml"
+configfile: "config_main.yaml"
 
 VCF = config.get("final_vcf_full")
 METAFILE = config.get("METAFILE", config.get("metafile", None))
-INTERVALS_TSV = config.get("intervals_tsv", "results/scantools/intervals.tsv")
 PIAWKA_CORES = int(config.get("piawka_cores", 2))
 PIAWKA_MISS_GENERAL = float(config.get("piawka_miss_general", 0.5))
 PIAWKA_MISS_TAJIMA = float(config.get("piawka_miss_tajima", 0.0))
 PIAWKA_BED = config.get("piawka_bed", "results/piawka/intervals.bed")
+
+# default window size (can be overridden in config under GenomeScan.window)
+window_default = config.get("GenomeScan", {}).get("window", 10000)
+
+
+
 
 if VCF is None:
     raise ValueError("config['final_vcf_full'] must be set")
@@ -53,20 +58,42 @@ rule piawka_all:
 
 
 rule convert_intervals_to_bed:
-    """Convert chrom\tstart\tend (1-based inclusive) intervals TSV to 0-based BED (end exclusive)."""
+    """Generate BED intervals from FASTA file using sliding windows."""
     input:
-        INTERVALS_TSV
+        fasta=config.get("GENOME")
     output:
         bed=PIAWKA_BED
+    params:
+        window=window_default
     run:
+        import os
+        
         os.makedirs(os.path.dirname(output.bed) or '.', exist_ok=True)
-        with open(input[0]) as inp, open(output.bed, 'w') as out:
-            for ln in inp:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                chrom, start, end = ln.split('\t')
-                out.write(f"{chrom}\t{int(start)-1}\t{end}\n")
+        
+        with open(input.fasta, 'r') as fasta, open(output.bed, 'w') as out:
+            chrom = None
+            seq_len = 0
+            
+            for line in fasta:
+                line = line.strip()
+                if line.startswith('>'):
+                    # Write windows for previous chromosome
+                    if chrom is not None:
+                        for start in range(0, seq_len, params.window):
+                            end = min(start + params.window, seq_len)
+                            out.write(f"{chrom}\t{start}\t{end}\n")
+                    
+                    # Start new chromosome
+                    chrom = line[1:].split()[0]
+                    seq_len = 0
+                else:
+                    seq_len += len(line)
+            
+            # Write windows for last chromosome
+            if chrom is not None:
+                for start in range(0, seq_len, params.window):
+                    end = min(start + params.window, seq_len)
+                    out.write(f"{chrom}\t{start}\t{end}\n")
 
 
 rule generate_piawka_groups_mixed:

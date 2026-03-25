@@ -1,29 +1,47 @@
-# Please check the parameters, and adjust them according to your circumstance
+# Main configuration for snakeSNPcalling.
+#
+# Practical rule of thumb:
+# - always change PROJECT, GENOME, ANNOTATION, METAFILE, and INPUT for a new dataset
+# - change SEQTYPE when switching between WGS and ddRAD
+# - change scatter settings only when you need a different runtime / memory tradeoff
+# - change variant-filter thresholds only when coverage or data quality differ substantially
 
-# Project name
+# Project name used under FINALOUTPUT/PROJECT
 PROJECT: "Biscutella_remapping_varia"
 
 # ================== Control of the workflow ==================
 
-## Do you need to do quality control?
+## Whether to run the QC stage when that stage is wired into the launcher.
 QC: no # "yes" or "no"
 
-## Do you need to do trimming?
+## Whether mapping should consume trimmed FASTQs instead of raw FASTQs.
 TRIMMING: "yes" # "yes" or "no"?
 
+## Sequencing data type controls duplicate handling
+## - wgs: run Picard MarkDuplicates and use dedup BAMs downstream
+## - ddrad: skip MarkDuplicates and use merged BAMs downstream
+SEQTYPE: "wgs" # "wgs" or "ddrad"
 
+# Reference FASTA and annotation used by mapping, calling, and downstream analyses.
+# Change these together when switching assembly releases.
 GENOME:
     "/data/users/rchoudhury/Biscutella_Genomes/data/Varia_review2.FINAL.Syri.fa"
+ANNOTATION:
+    "/data/users/rchoudhury/Biscutella_Genomes/Biscutella_centromeres_and_chromosome_evolution/Genome_annotations/Genes/Varia.all.maker.renamed.gff"
 
-
-# set SCAFFOLDS as "ALL" if you want to run on all scaffolds :: impliment only if limited number of scaffolds, else split snakemake into multiple jobs :: test it
-# else give a txt file with names of scaffolds (one per line)
+# Use SCAFFOLDS: "ALL" for a full run.
+# For debugging or pilot runs, provide a text file with one scaffold name per line.
 SCAFFOLDS:
     "ALL"
 
+# Sample metadata sheet.
+# Typical required columns are sample, ploidy, fq1, fq2, plus either sample_lane,
+# or enough columns to reconstruct it (sample/lane[/sample_barcode]).
 METAFILE:
     "/data/users/rchoudhury/snakeSNPcalling/configs/metadata_fixed.tsv"
 
+# INPUT points to the read root used by the broader workflow.
+# FINALOUTPUT is the base output directory; PROJECT is appended under it.
 INPUT:
     "/data/users/rchoudhury/Biscutella_wgs_remapping_2025/data/raw/all"
 FINALOUTPUT: /data/users/rchoudhury/snakeSNPcalling/results
@@ -31,17 +49,66 @@ FINALOUTPUT: /data/users/rchoudhury/snakeSNPcalling/results
 # Directory where log files for each pipeline step will be stored
 log_folder: "logs"
 
+# Temporary directory used by GATK and other tools.
+# Prefer fast local scratch when available.
 tmpdir: "tmp"
 
-scatter_mode: "interval" # "chromosome" or "interval"
+# ------------------ Scatter strategy ------------------
+# Global fallback values used only if stage-specific keys are not set.
+scatter_mode: "interval" # default fallback for calling stages that do not override mode
+
+# HaplotypeCaller scatter scheme.
+# Recommended:
+# - chromosome for chromosome-scale assemblies, often with Bv1-9+rest
+# - interval when you need more balanced per-sample jobs
+haplotypecaller_scatter_mode: "interval" # "chromosome" or "interval"
+
+# Joint genotyping scatter scheme used by GenomicsDBImport + GenotypeGVCFs.
+# Recommended:
+# - interval when joint genotyping jobs become too large on whole chromosomes
+jointgenotyping_scatter_mode: "interval" # "chromosome" or "interval"
+
+# Global fallback chromosome grouping.
+chromosome_groups: "all" # default fallback for stage-specific chromosome groups
+
+# When scatter_mode is chromosome, valid values are:
+# - all
+# - a prefix-range-rest pattern such as Bv1-9+rest
+haplotypecaller_chromosome_groups: "all" # "all" or a range+rest pattern such as "Bv1-9+rest"
+jointgenotyping_chromosome_groups: "all" # "all" or a range+rest pattern such as "Bv1-9+rest"
+
+# Base directory for interval files. The workflow will create stage-specific subdirectories here.
 intervals_dir: "data/intervals"
-scatter_count: 100
 
-# Following https://github.com/AndersenLab/wi-gatk/blob/master/main.nf for values
+# Global fallback interval scatter count.
+# Increase for smaller jobs; decrease if the DAG becomes too large.
+scatter_count: 100 # default fallback for stage-specific interval scatter counts
+
+# Stage-specific interval counts.
+haplotypecaller_scatter_count: 100
+jointgenotyping_scatter_count: 100
+
+# ------------------ GATK calling and filtering ------------------
+# Resource values under by_scatter_mode are stage-specific runtime settings.
+# The remaining keys in HaplotypeCaller are downstream VCF filter thresholds.
 HaplotypeCaller:
-  minConfidenceForVariantCalling: "20" # would not be used in haplotypecaller, but instead in genotypegvfs
+  minConfidenceForVariantCalling: "20" # currently used downstream during joint genotyping, not as a primary HC hard filter
+  by_scatter_mode:
+    interval:
+      threads: 4
+      mem_mb: 8000
+      time: "3-0"
+      java_xms: "6G"
+      java_xmx: "6G"
+    chromosome:
+      threads: 4
+      mem_mb: 8000
+      time: "3-0"
+      java_xms: "6G"
+      java_xmx: "6G"
 
-# Quality by Depth (QD) < 1.5 (for tetraploid), FisherStrand (FS) > 60.0, RMSMappingQuality (MQ) < 40.0, MappingQualityRankSumTest (MQRS) < −12.5, ReadPosRankSum < −8.0, StrandOddsRatio (SOR) > 3.0
+  # Site-level filtering thresholds used in downstream filtering.
+  # Do not change these casually; tune them only if your coverage or data quality differs strongly.
   min_depth: 4
   qual: 30.0
   strand_odds_ratio: 3.0
@@ -52,11 +119,49 @@ HaplotypeCaller:
   ReadPosRankSum: -8.0
   high_missing: 0.95
   high_heterozygosity: 0.10
-  # GQ: 10.0 do not use GQ filter, instead work on depth , 8 for tetra, 4 for dip
+  # GQ is intentionally not used here; depth masking is preferred in this workflow.
 
 GenotypeGVCFs:
   minConfidenceForVariantCalling: "10"
+  by_scatter_mode:
+    interval:
+      threads: 4
+      mem_mb: 5000
+      time: "3-0"
+      java_heap_mb: 3750
+      max_alternate_alleles: 12
+      only_output_calls_starting_in_intervals: true
+    chromosome:
+      threads: 4
+      mem_mb: 8000
+      time: "3-0"
+      java_heap_mb: 6000
+      max_alternate_alleles: 12
+      only_output_calls_starting_in_intervals: false
 
+# Joint-genotyping database import settings.
+# batch_size, interval_padding, and merge_input_intervals mostly matter for performance and memory behavior.
+GenomicsDBImport:
+  by_scatter_mode:
+    interval:
+      threads: 4
+      mem_mb: 6000
+      java_xms: "4G"
+      java_xmx: "4G"
+      batch_size: 50
+      interval_padding: 1000
+      merge_input_intervals: true
+    chromosome:
+      threads: 4
+      mem_mb: 6000
+      java_xms: "4G"
+      java_xmx: "4G"
+      batch_size: 50
+      interval_padding: 0
+      merge_input_intervals: false
+
+# Per-ploidy genotype depth masking.
+# Change these when expected depth differs a lot between projects.
 GATK:
   min_depth:
     tetra: 8
@@ -64,9 +169,12 @@ GATK:
   max_depth:
     tetra: 150
     di: 150
+  INDEL:
+    min_support: 5
 
 
-
+# FreeBayes is optional and separate from the main GATK calling path.
+# Leave these unchanged unless you actively run the FreeBayes workflow.
 FreeBayes:
   chunks: 50000
   theta: 0.001 # mutation rate / expected pairwise nucleotide diversity (freebayes default 0.001)
@@ -75,8 +183,12 @@ FreeBayes:
   min_base_quality: 20 # minimum base quality for variant calling
   min_mapping_quality: 20 # minimum mapping quality for variant calling
 
+# Convenience pointers for downstream tools and analyses.
+final_vcf: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz"
+final_vcf_full: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/gatk4/final_vcf/missingness_filtered.vcf.gz"
 
 
+# ------------------ Downstream population analyses ------------------
 Structure:
   # ───── choose run mode ─────
   run_mode: "bestK"        # "fixed"  or  "bestK", changing to always use bestK
@@ -86,9 +198,29 @@ Structure:
   burnin: 100000 # Number of burn-in iterations
   mcmc: 1000000 # Total number of iterations
   ploidy: 4 # Ploidy of the organism (default is 2 for diploid)
-  time: "2-00:00:00" # Time limit for the job, adjust as needed
+  time: "15-00:00:00" # Time limit for the job, adjust as needed
 
 
 PCA:
   # ───── PCA parameters ─────
   ploidy: mixed # "diploid", "tetraploid" or "mixed"
+
+
+popgen_investigate:
+  # ───── Dsuite parameters ─────
+  tree: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/phylogeny/all_individuals_Neis_distance.nwk"
+  outgroups: ["V2", "K2"] # list of outgroup samples for Dsuite (can be multiple) 
+  vcf: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz"
+  treemix_metadata: "/data/users/rchoudhury/snakeSNPcalling/configs/treemix_metadata.tsv"
+  treemix_migration_events: [0, 1, 2, 3, 4, 5] # migration events to test
+  treemix_bootstraps: 100 # number of bootstrap replicates for Treemix
+  treemix_k: 500 # size of blocks of SNPs to account for linkage disequilibrium in Treemix
+  # ───── Phylogenetic tree parameters ─────
+  phylo_metadata: "/data/users/rchoudhury/snakeSNPcalling/configs/metadata_fixed.tsv"
+  phylo_bootstraps: 100 # number of bootstrap replicates for phylogenetic tree construction
+  phylo_outgroup: "Varia_1" # outgroup sample for rooting the tree
+  # ───── Twisst parameters ─────
+  twisst_metadata: "/data/users/rchoudhury/snakeSNPcalling/configs/metadata_fixed.tsv"
+  twisst_window_size: 50 # number of SNPs per window for Twisst analysis
+  twisst_step_size: 10 # step size between windows for Twisst analysis
+  twisst_replicates: 1000 # number of bootstrap replicates for Twisst analysis

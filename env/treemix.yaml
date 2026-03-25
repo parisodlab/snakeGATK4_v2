@@ -1,0 +1,9 @@
+name: treemix
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - treemix
+  - r-base
+  - python

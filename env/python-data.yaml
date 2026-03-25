@@ -1,16 +1,15 @@
-name: vcf_annotation
+name: python-data
 channels:
   - conda-forge
-  - bioconda
   - defaults
 dependencies:
   - python=3.10
-  - cyvcf2
   - numpy
   - pandas
-  - bcftools
-  - tabix
+  - scipy
+  - scikit-learn
+  - pyarrow
+  - twisst
   - pip
-  - degenotate=1.3
-
-
+  - pip:
+    - pyslim

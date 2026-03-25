@@ -1,36 +1,13 @@
-"""
-Snakemake rules to run pixy in parallel over windows (and site-level windows) using
-an intervals TSV and the final VCF from config.
-
-Config expectations (set in your workflow config YAML):
-  vcf_final_full: path/to/final.vcf.gz
-  pixy_populations: path/to/populations.txt
-  intervals_tsv: path/to/intervals.tsv   # defaults to results/scantools/intervals.tsv
-  pixy_stats: ["pi","dxy","fst","watterson_theta","tajima_d"]
-  pixy_cores: 2
-
-This file creates three rule types:
-  - per-window windowed estimates (window-size = window length)
-  - per-window site-level estimates (--window_size 1)
-  - a single global pixy run (no interval arguments)
-
-Notes:
-  - The intervals file must be a TSV with columns: chrom, start, end (1-based inclusive)
-  - Pixy CLI flags and output naming differ between versions; edit the shell command
-    inside the rules to match your installed pixy version if necessary.
-"""
-
 import os
-import csv
-configfile: "config.yaml"
+import subprocess
+configfile: "config_main.yaml"
 
 # Configurable values with sane defaults
 VCF = config.get("final_vcf_full")
 # Path for populations file used by pixy; if not provided, we will generate it from METAFILE
 POPS = config.get("pixy_populations", config.get("populations_file", "configs/pixy_populations.txt"))
 METAFILE = config.get("METAFILE", config.get("metafile", None))
-INTERVALS_TSV = config.get("intervals_tsv", "results/scantools/intervals.tsv")
-PIXY_WINDOW = config.get("pixy_window", config.get("window", 100000))
+PIXY_WINDOW = config.get("pixy_window", config.get("window", 10000))
 PIXY_STEP = config.get("pixy_step", PIXY_WINDOW)
 STATS = config.get("pixy_stats", ["pi","dxy","fst","watterson_theta","tajima_d"]) 
 N_CORES = config.get("pixy_cores", 2)
@@ -49,9 +26,10 @@ def _all_merged_targets():
     targets = []
     for p in ploidies:
         for stat in STATS:
-            targets.append(f"results/pixy/{p}/pixy_sitelevel_{stat}_merged.tsv")
-            targets.append(f"results/pixy/{p}/pixy_windowed_{stat}_merged.tsv")
-        targets.append(f"results/pixy/{p}/global/.done")
+            # Prefer aggregated (gzipped) windowed statistics as final targets
+            targets.append(f"results/pixy/{p}/pixy_windowed_{stat}_aggregated.tsv.gz")
+            # Also include merged site-level stats (gzipped) for completeness
+            targets.append(f"results/pixy/{p}/pixy_sitelevel_{stat}_merged.tsv.gz")
     return targets
 
 
@@ -60,36 +38,84 @@ rule all:
     """
     input:
         POPS,
-        INTERVALS_TSV,
+        "results/pixy/chroms_generated.done",
         lambda wildcards: _all_merged_targets()
 
-# checkpoint to generate intervals TSV from the VCF header (creates sliding windows)
-checkpoint make_intervals:
-    output:
-        INTERVALS_TSV
-    threads:
-        1
-    shell:
-        """
-        mkdir -p $(dirname {output[0]})
-        # generate tiled intervals from VCF contigs using helper script
-        mkdir -p $(dirname {output[0]})
-        python3 scripts/generate_intervals.py {VCF} {output[0]} {PIXY_WINDOW} {PIXY_STEP}
-        """
 
+def _variant_contigs(path):
+    """Return a list of contigs that have at least one variant in the VCF.
 
-def _read_intervals_from_checkpoint():
-    ck = checkpoints.make_intervals.get()
-    path = ck.output[0]
-    intervals = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            chrom,start,end = line.split('\t')
-            intervals.append((chrom,start,end))
-    return intervals
+    Prefer using `bcftools query` to efficiently list CHROM values from
+    variant records. Fall back to streaming the VCF and collecting the
+    first column from non-header lines (gzip-aware).
+    """
+    if not os.path.exists(path):
+        return []
+    try:
+        p = subprocess.run(["bcftools", "query", "-f", "%CHROM\n", path], capture_output=True, text=True)
+        out = p.stdout or ""
+        lines = [l.strip() for l in out.splitlines() if l.strip()]
+        # uniq while preserving order
+        seen = set()
+        uniq = []
+        for l in lines:
+            if l not in seen:
+                seen.add(l)
+                uniq.append(l)
+        if uniq:
+            return uniq
+    except Exception:
+        pass
+        
+
+# simple cache to avoid repeated bcftools calls during DAG construction
+_chrom_cache = {}
+# ...existing code...
+def _chroms(ploidy=None):
+    """Return a sorted list of unique chromosome names.
+    ...
+    """
+    # return cached value when available
+    cache_key = str(ploidy)
+    if cache_key in _chrom_cache:
+        return _chrom_cache[cache_key]
+    
+    # First, try reading a precomputed chrom list written by the checkpoint
+    chroms_dir = os.path.join('results', 'pixy', 'vcfs_by_ploidy')
+    if ploidy is not None:
+        chroms_file = os.path.join(chroms_dir, f"chroms_{ploidy}.txt")
+        if os.path.exists(chroms_file):
+            with open(chroms_file) as fh:
+                lines = [l.strip() for l in fh if l.strip()]
+            if lines:
+                result = sorted(dict.fromkeys(lines))
+                _chrom_cache[cache_key] = result
+                return result
+
+    # First, try per-ploidy VCF (if requested)
+    if ploidy is not None:
+        try:
+            ck = checkpoints.split_by_ploidy.get()
+            vdir = ck.output[0]
+            ppath = os.path.join(vdir, f"ploidy_{ploidy}.vcf.gz")
+            # Prefer contigs that actually have variant records; fall back to header contigs
+            contigs = _variant_contigs(ppath)
+            if contigs:
+                result = sorted(dict.fromkeys(contigs))
+                _chrom_cache[cache_key] = result
+                return result
+        except Exception:
+            pass
+
+    # Next, try global VCF
+    contigs = _variant_contigs(VCF)
+    if contigs:
+        result = sorted(dict.fromkeys(contigs))
+        _chrom_cache[cache_key] = result
+        return result
+
+    _chrom_cache[cache_key] = []
+    return []
 
 
 # checkpoint to split the VCF by ploidy (reads ploidy from METAFILE)
@@ -111,29 +137,25 @@ checkpoint split_by_ploidy:
         df = pd.read_csv(input.metafile, sep='\t', dtype=str)
         if 'ploidy' not in df.columns or 'sample' not in df.columns:
             raise ValueError('METAFILE must contain `sample` and `ploidy` columns')
+        # Determine ploidies and write lightweight auxiliary files so the
+        # checkpoint remains fast during DAG construction. Heavy work
+        # (bcftools subsetting) is performed by the rule `create_ploidy_vcf`.
         ploidies = df['ploidy'].unique().tolist()
-        # for each ploidy, subset samples and create a per-ploidy VCF.gz
+        # write a small ploidies manifest and per-ploidy sample lists
+        ploidies_file = os.path.join(outdir, 'ploidies.txt')
+        with open(ploidies_file, 'w') as ph:
+            for pl in ploidies:
+                ph.write(str(pl) + "\n")
         for pl in ploidies:
-            # get samples for this ploidy and remove duplicates
             samples = df.loc[df['ploidy'] == pl, 'sample'].tolist()
-            samples = list(set(samples))  # remove duplicates
+            samples = list(dict.fromkeys(samples))
             if not samples:
                 continue
-            sample_list = ",".join(samples)
-            out_vcf = os.path.join(outdir, f"ploidy_{pl}.vcf.gz")
-            # if only one ploidy overall, just copy the VCF to avoid unnecessary subsetting
-            if len(ploidies) == 1:
-                shell(f"cp {input.vcf} {out_vcf}")
-                shell(f"tabix -p vcf {out_vcf} || true")
-            else:
-                # subset samples then filter sites with >50% missingness to reduce downstream work
-                # tmpdir = os.environ.get("SCRATCH", "/tmp")
-                # os.makedirs(tmpdir+"/"+outdir, exist_ok=True)
-                # tmp = "$SCRATCH/" + out_vcf + ".tmp.vcf.gz"
-                shell(f"bcftools view -s {sample_list} {input.vcf} -Oz -o {out_vcf} --threads {threads}")
-                # shell(f"bcftools filter --threads {threads} -i 'F_MISSING <= 0.5' {tmp} -Oz -o {out_vcf}")
-                # NOTEs: we are here not removing sites with missing data as according to https://github.com/ksamuk/pixy/issues/119, it is not necessary
-                shell(f"tabix -p vcf {out_vcf} || true")
+            samples_file = os.path.join(outdir, f"samples_{pl}.txt")
+            # write newline-separated sample names; the VCF creation rule will join them
+            with open(samples_file, 'w') as sf:
+                for s in samples:
+                    sf.write(s + "\n")
 
 
 def _ploidies():
@@ -146,23 +168,209 @@ def _ploidies():
     return pl
 
 
+rule create_ploidy_vcf:
+    """Create per-ploidy VCFs from per-ploidy sample lists written by the checkpoint.
+
+    This is separated from the checkpoint so DAG construction stays fast.
+    """
+    input:
+        ck_dir=lambda wildcards: checkpoints.split_by_ploidy.get().output[0]
+    output:
+        touch("results/pixy/vcfs_by_ploidy_created.done")
+    threads:
+        50
+    run:
+        import os, glob, subprocess
+        vdir = checkpoints.split_by_ploidy.get().output[0]
+        # find all samples_{pl}.txt files and create ploidy_{pl}.vcf.gz
+        for sf in glob.glob(os.path.join(vdir, 'samples_*.txt')):
+            pl = os.path.basename(sf).split('_',1)[1].replace('.txt','')
+            with open(sf) as fh:
+                samples = [l.strip() for l in fh if l.strip()]
+            if not samples:
+                continue
+            sample_list = ",".join(samples)
+            out_vcf = os.path.join(vdir, f"ploidy_{pl}.vcf.gz")
+            # if only one ploidy overall, copy global VCF; otherwise subset
+            # We'll check for an indicator file ploidies.txt to determine count
+            pl_file = os.path.join(vdir, 'ploidies.txt')
+            pl_count = 1
+            try:
+                with open(pl_file) as ph:
+                    pl_count = len([l for l in ph if l.strip()])
+            except Exception:
+                pass
+            if pl_count == 1:
+                shell(f"cp {VCF} {out_vcf}")
+                shell(f"tabix -p vcf {out_vcf} || true")
+            else:
+                # use a small fixed number of threads for subsetting
+                shell(f"bcftools view -s {sample_list} {VCF} -Oz -o {out_vcf} --threads 1") 
+                shell(f"tabix -p vcf {out_vcf} || true")
+            # per-ploidy VCFs are created here; querying chromosomes is handled
+            # centrally by the `generate_pixy_chroms` rule to keep DAG solving fast.
+        # touch sentinel (outside checkpoint dir to avoid nested outputs)
+        shell(f"touch {output[0]}")
+
+
+rule generate_pixy_chroms:
+    """Generate per-ploidy and global chromosome lists for pixy.
+
+    Depends on the `split_by_ploidy` checkpoint so per-ploidy VCFs are available.
+    Writes per-ploidy lists to `results/pixy/vcfs_by_ploidy/chroms_{ploidy}.txt`
+    and a global list `results/pixy/chroms_global.txt` and touches
+    `results/pixy/chroms_generated.done` as a sentinel.
+    """
+    input:
+        ck_dir=lambda wildcards: checkpoints.split_by_ploidy.get().output[0],
+        vcfs_created="results/pixy/vcfs_by_ploidy_created.done"
+    output:
+        touch("results/pixy/chroms_generated.done")
+    run:
+        import glob, os, subprocess
+        vdir = checkpoints.split_by_ploidy.get().output[0]
+        # per-ploidy files
+        pats = glob.glob(os.path.join(vdir, "ploidy_*.vcf.gz"))
+        all_chroms = []
+        for p in pats:
+            pl = os.path.basename(p).split('_',1)[1].replace('.vcf.gz','')
+            try:
+                proc = subprocess.run(["bcftools", "query", "-f", "%CHROM\n", p], capture_output=True, text=True)
+                out = proc.stdout or ""
+                lines = [l.strip() for l in out.splitlines() if l.strip()]
+                # preserve order and uniq
+                seen = set(); uniq = []
+                for l in lines:
+                    if l not in seen:
+                        seen.add(l); uniq.append(l)
+                chroms_file = os.path.join(vdir, f"chroms_{pl}.txt")
+                with open(chroms_file, 'w') as fh:
+                    for c in uniq:
+                        fh.write(c + "\n")
+                all_chroms.extend([c for c in uniq if c not in all_chroms])
+            except Exception:
+                # fallback: try to stream the VCF (gzip-aware)
+                try:
+                    import gzip
+                    chroms = []
+                    opener = gzip.open if p.endswith('.gz') else open
+                    with opener(p, 'rt') as fh:
+                        for line in fh:
+                            if line.startswith('#'):
+                                continue
+                            chrom = line.split('\t',1)[0].strip()
+                            if chrom and chrom not in chroms:
+                                chroms.append(chrom)
+                    chroms_file = os.path.join(vdir, f"chroms_{pl}.txt")
+                    with open(chroms_file, 'w') as fh:
+                        for c in chroms:
+                            fh.write(c + "\n")
+                    all_chroms.extend([c for c in chroms if c not in all_chroms])
+                except Exception:
+                    # continue if both methods fail
+                    continue
+
+        # write global chroms file
+        global_file = os.path.join('results', 'pixy', 'chroms_global.txt')
+        os.makedirs(os.path.dirname(global_file), exist_ok=True)
+        with open(global_file, 'w') as gh:
+            for c in all_chroms:
+                gh.write(c + "\n")
+
+
+
 def _pixy_window_targets(wc):
-    intervals = _read_intervals_from_checkpoint()
-    ploidies = _ploidies()
+    """Return per-chromosome windowed pixy output paths.
+
+    If called with a wildcard object that contains `ploidy`, only targets for
+    that ploidy are returned (used by merge rules). Otherwise, return targets
+    for all ploidies.
+    """
     targets = []
+    # if called as a wildcard function, use the provided ploidy
+    p = getattr(wc, 'ploidy', None)
+    if p:
+        chroms = _chroms(ploidy=p)
+        if not chroms:
+            ck = checkpoints.split_by_ploidy.get()
+            vdir = ck.output[0] if ck and ck.output else '<unknown>'
+            ppath = os.path.join(vdir, f"ploidy_{p}.vcf.gz")
+            raise ValueError(f"No contigs found for ploidy {p}. Check per-ploidy VCF: {ppath} or global VCF: {VCF}")
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/windowed/{c}/pixy_windowed_pi.txt")
+        return targets
+
+    # no specific ploidy provided; return all ploidies
+    ploidies = _ploidies()
     for p in ploidies:
-        for (c,s,e) in intervals:
-            targets.append(f"results/pixy/{p}/windowed/{c}_{s}_{e}/.done")
+        chroms = _chroms(ploidy=p)
+        if not chroms:
+            ck = checkpoints.split_by_ploidy.get()
+            vdir = ck.output[0] if ck and ck.output else '<unknown>'
+            ppath = os.path.join(vdir, f"ploidy_{p}.vcf.gz")
+            raise ValueError(f"No contigs found for ploidy {p}. Check per-ploidy VCF: {ppath} or global VCF: {VCF}")
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/windowed/{c}/pixy_windowed_pi.txt")
     return targets
 
 
 def _pixy_site_targets(wc):
-    intervals = _read_intervals_from_checkpoint()
-    ploidies = _ploidies()
+    """Return per-chromosome site-level pixy output paths.
+
+    Uses the wildcard `ploidy` when available, otherwise returns targets for
+    all ploidies.
+    """
     targets = []
+    p = getattr(wc, 'ploidy', None)
+    if p:
+        chroms = _chroms(ploidy=p)
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/sitelevel/{c}/pixy_site_pi.txt")
+        return targets
+
+    ploidies = _ploidies()
     for p in ploidies:
-        for (c,s,e) in intervals:
-            targets.append(f"results/pixy/{p}/sitelevel/{c}_{s}_{e}/.done")
+        chroms = _chroms(ploidy=p)
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/sitelevel/{c}/pixy_site_pi.txt")
+    return targets
+
+
+def _pixy_window_done_targets(wc):
+    """Return the sentinel .done paths for windowed pixy outputs.
+
+    This is used by merge rules so they depend on the declared sentinel
+    outputs (which Snakemake tracks) instead of raw pixy text files.
+    """
+    targets = []
+    p = getattr(wc, 'ploidy', None)
+    if p:
+        chroms = _chroms(ploidy=p)
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/windowed/{c}/.done")
+        return targets
+    ploidies = _ploidies()
+    for p in ploidies:
+        chroms = _chroms(ploidy=p)
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/windowed/{c}/.done")
+    return targets
+
+
+def _pixy_site_done_targets(wc):
+    """Return the sentinel .done paths for site-level pixy outputs."""
+    targets = []
+    p = getattr(wc, 'ploidy', None)
+    if p:
+        chroms = _chroms(ploidy=p)
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/sitelevel/{c}/.done")
+        return targets
+    ploidies = _ploidies()
+    for p in ploidies:
+        chroms = _chroms(ploidy=p)
+        for c in chroms:
+            targets.append(f"results/pixy/{p}/sitelevel/{c}/.done")
     return targets
 
 
@@ -219,27 +427,19 @@ rule generate_ploidy_populations:
             sub.to_csv(output.popfile, sep='\t', header=False, index=False)
 
 
-rule pixy_all:
-    input:
-        lambda wildcards: _pixy_window_targets(wildcards) + _pixy_site_targets(wildcards) + [global_target]
-
-
 rule pixy_windowed:
     input:
         populations=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
-        any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz"),
-        intervals=INTERVALS_TSV,
+        any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     output:
-        touch("results/pixy/{ploidy}/windowed/{chrom}_{start}_{end}/.done")
+        touch("results/pixy/{ploidy}/windowed/{chrom}/.done")
     threads:
-        2
+        10
     resources:
-        mem_mb=20000
+        mem_mb=10000
     params:
-        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/windowed/{wildcards.chrom}_{wildcards.start}_{wildcards.end}",
-        start=lambda wildcards: int(wildcards.start),
-        end=lambda wildcards: int(wildcards.end),
-        window_size=lambda wildcards: int(wildcards.end) - int(wildcards.start) + 1,
+        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/windowed/{wildcards.chrom}",
+        window_size=PIXY_WINDOW,
         stats=" ".join(STATS),
         pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
         vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
@@ -247,102 +447,72 @@ rule pixy_windowed:
         "../env/pixy.yaml"
     shell:
         """
-    mkdir -p {params.outdir}
-    # create a small BED with this interval and run pixy against it
-    bed_file={params.outdir}/interval.bed
-    printf '%s\t%s\t%s\n' {wildcards.chrom} {params.start} {params.end} > "$bed_file"
 
-    pixy --stats {params.stats} \
-        --fst_type hudson \
-        --vcf {params.vcf} \
-        --populations {params.pops} \
-        --bed_file "$bed_file" \
-        --n_cores {threads} \
-        --output_folder {params.outdir} \
-        --output_prefix pixy_windowed
-    # filter NA rows and gzip outputs to save space
-    python3 scripts/filter_and_gzip_pixy.py {params.outdir} pixy_windowed
-    rm -f "$bed_file"
-    touch {output}
-    """
+        mkdir -p {params.outdir}
+
+        pixy --stats {params.stats} \
+            --vcf {params.vcf} \
+            --populations {params.pops} \
+            --chrom {wildcards.chrom} \
+            --window_size {params.window_size} \
+            --n_cores {threads} \
+            --fst_type hudson \
+            --output_folder {params.outdir} \
+            --output_prefix pixy_windowed
+
+        # gzip any plain-text pixy outputs (compress all .txt stat files)
+        if ls {params.outdir}/*.txt 1> /dev/null 2>&1; then
+            gzip -f {params.outdir}/*.txt || true
+        fi
+
+        # Create sentinel to indicate completion
+        touch {output[0]}
+
+        """
 
 
 rule pixy_sitelevel:
     input:
         populations=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
-        any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz"),
-        intervals=INTERVALS_TSV,
-    output:
-        touch("results/pixy/{ploidy}/sitelevel/{chrom}_{start}_{end}/.done")
-    threads:
-        2
-    resources:
-        mem_mb=20000
-    conda:
-        "../env/pixy.yaml"
-    params:
-        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/sitelevel/{wildcards.chrom}_{wildcards.start}_{wildcards.end}",
-        start=lambda wildcards: int(wildcards.start),
-        end=lambda wildcards: int(wildcards.end),
-        stats=" ".join(STATS),
-        pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
-        vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
-    conda:
-        "../env/pixy.yaml"
-    params:
-        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/sitelevel/{wildcards.chrom}_{wildcards.start}_{wildcards.end}",
-        start=lambda wildcards: int(wildcards.start),
-        end=lambda wildcards: int(wildcards.end),
-        stats=" ".join(STATS),
-        pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
-        vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
-    shell:
-        """
-    mkdir -p {params.outdir}
-    # Site-level estimates: run pixy on the per-ploidy VCF but restrict to the interval
-    pixy --stats {params.stats} \
-        --fst_type hudson \
-        --vcf {params.vcf} \
-        --populations {params.pops} \
-        --window_size 1 \
-        --chromosomes '{wildcards.chrom}' \
-        --interval_start {params.start} \
-        --interval_end {params.end} \
-        --n_cores {threads} \
-        --output_folder {params.outdir} \
-        --output_prefix pixy_site
-        # filter NA rows and gzip outputs to save space
-        python3 scripts/filter_and_gzip_pixy.py {params.outdir} pixy_site
-        touch {output}
-        """
-rule pixy_global:
-    input:
-        populations=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
         any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     output:
-        touch("results/pixy/{ploidy}/global/.done")
+        touch("results/pixy/{ploidy}/sitelevel/{chrom}/.done")
     threads:
-        10
+        20
     resources:
-        mem_mb=60000
-    params:
-        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/global",
-        stats=" ".join(STATS),
-        pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
-        vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
+        mem_mb=50000,
+        time="3-00:00:00"
     conda:
         "../env/pixy.yaml"
+    params:
+        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/sitelevel/{wildcards.chrom}",
+        stats=" ".join(STATS),
+        pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
+        vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz"),
+        out_prefix="pixy_site"
     shell:
         """
-        mkdir -p {params.outdir}
+        # Site-level estimates: run pixy on the per-ploidy VCF but restrict to the interval
         pixy --stats {params.stats} \
-                --vcf {params.vcf} \
-                --populations {params.pops} \
-                --n_cores {threads} \
-                --output_folder {params.outdir} \
-                --output_prefix pixy_global 
-        touch {output}
+            --fst_type hudson \
+            --vcf {params.vcf} \
+            --populations {params.pops} \
+            --chrom {wildcards.chrom} \
+            --window_size 1 \
+            --n_cores {threads} \
+            --output_folder {params.outdir} \
+            --output_prefix {params.out_prefix}
+
+        # gzip any plain-text pixy site outputs (compress all .txt stat files)
+        if ls {params.outdir}/*.txt 1> /dev/null 2>&1; then
+            gzip -f {params.outdir}/*.txt || true
+        fi
+
+        # Create sentinel
+        touch {output[0]}
         """
+
+
 
 # Now merge all per-window and per-site pixy outputs into single TSVs for easier downstream analysis.
 # This assumes the pixy output files are named consistently with the above rules.
@@ -353,9 +523,9 @@ rule merge_pixy_windowed_by_stat:
     Produces files like results/pixy/pixy_windowed_dxy_merged.tsv
     """
     input:
-        lambda wildcards: _pixy_window_targets(wildcards)
+        lambda wildcards: _pixy_window_done_targets(wildcards)
     output:
-        "results/pixy/{ploidy}/pixy_windowed_{stat}_merged.tsv"
+        "results/pixy/{ploidy}/pixy_windowed_{stat}_merged.tsv.gz"
     params:
         stat=lambda wildcards: wildcards.stat
     run:
@@ -376,9 +546,77 @@ rule merge_pixy_windowed_by_stat:
                 all_dfs.append(df)
         if all_dfs:
             merged_df = pd.concat(all_dfs, ignore_index=True)
-            merged_df.to_csv(outpath, sep='\t', index=False)
+            # write gzipped merged TSV
+            merged_df.to_csv(outpath, sep='\t', index=False, compression='gzip')
         else:
-            pd.DataFrame().to_csv(outpath, sep='\t', index=False)
+            pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
+
+
+rule aggregate_pixy_windowed_by_stat:
+    """Aggregate merged windowed pixy outputs by summing raw counts across windows
+    and recomputing statistics using the canonical columns `count_diffs` and
+    `count_comparisons` (falling back to heuristics only if those are missing).
+
+    Input: results/pixy/{ploidy}/pixy_windowed_{stat}_merged.tsv
+    Output: results/pixy/{ploidy}/pixy_windowed_{stat}_aggregated.tsv
+    """
+    input:
+        # accept gzipped merged input
+        merged=lambda wildcards: f"results/pixy/{wildcards.ploidy}/pixy_windowed_{wildcards.stat}_merged.tsv.gz"
+    output:
+        agg="results/pixy/{ploidy}/pixy_windowed_{stat}_aggregated.tsv.gz"
+    params:
+        stat=lambda wildcards: wildcards.stat
+    run:
+        import pandas as pd
+        import os, re
+        from pandas.api.types import is_numeric_dtype
+
+        inpath = input.merged
+        outpath = output.agg
+        os.makedirs(os.path.dirname(outpath) or '.', exist_ok=True)
+
+        # If merged gzipped input doesn't exist, try uncompressed name for backward compatibility
+        if not os.path.exists(inpath):
+            alt = inpath.replace('.tsv.gz', '.tsv')
+            if os.path.exists(alt):
+                inpath = alt
+
+        if not os.path.exists(inpath):
+            # write empty gzipped file if merged input missing
+            pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
+            return
+
+        # read either gzipped or plain TSV depending on the file
+        if inpath.endswith('.gz'):
+            df = pd.read_csv(inpath, sep='\t', compression='gzip')
+        else:
+            df = pd.read_csv(inpath, sep='\t')
+
+        # Determine grouping columns: non-numeric columns except coordinate-like ones
+        nonnum_cols = [c for c in df.columns if not is_numeric_dtype(df[c])]
+        coords = set(['start', 'end', 'position', 'pos', 'chrom', 'CHROM', 'chromosome'])
+        group_cols = [c for c in nonnum_cols if c.lower() not in coords]
+
+        numeric_cols = [c for c in df.columns if is_numeric_dtype(df[c])]
+
+        if group_cols:
+            aggregated = df.groupby(group_cols)[numeric_cols].sum().reset_index()
+        else:
+            # Global aggregation across all rows
+            aggregated = df[numeric_cols].sum().to_frame().T
+
+        # Prefer canonical pixy columns if present
+        stat = params.stat
+        if 'count_diffs' in aggregated.columns and 'count_comparisons' in aggregated.columns:
+            try:
+                aggregated[stat] = aggregated['count_diffs'] / aggregated['count_comparisons']
+            except Exception:
+                pass
+        
+        # (global chrom list is generated by `generate_pixy_chroms` rule)
+        # write gzipped aggregated output
+        aggregated.to_csv(outpath, sep='\t', index=False, compression='gzip')
 
 
 rule merge_pixy_sitelevel_by_stat:
@@ -387,9 +625,9 @@ rule merge_pixy_sitelevel_by_stat:
     Produces files like results/pixy/pixy_sitelevel_pi_merged.tsv
     """
     input:
-        lambda wildcards: _pixy_site_targets(wildcards)
+        lambda wildcards: _pixy_site_done_targets(wildcards)
     output:
-        "results/pixy/{ploidy}/pixy_sitelevel_{stat}_merged.tsv"
+        "results/pixy/{ploidy}/pixy_sitelevel_{stat}_merged.tsv.gz"
     params:
         stat=lambda wildcards: wildcards.stat
     run:
@@ -410,8 +648,8 @@ rule merge_pixy_sitelevel_by_stat:
                 all_dfs.append(df)
         if all_dfs:
             merged_df = pd.concat(all_dfs, ignore_index=True)
-            merged_df.to_csv(outpath, sep='\t', index=False)
+            merged_df.to_csv(outpath, sep='\t', index=False, compression='gzip')
         else:
-            pd.DataFrame().to_csv(outpath, sep='\t', index=False)
+            pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
 
 

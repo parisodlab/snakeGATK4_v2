@@ -1,0 +1,416 @@
+# Publication-ready downstream rules
+import os
+configfile: "config_main.yaml"
+
+# Path to four-fold degenerate sites produced by vcf annotation rule (06-vcf_annotation.rules)
+DEGEN_FOUR = os.path.join(config.get('final_output', 'final_output'), 'degeneracy', 'degeneracy-fourfold.bed')
+
+# Pixy merged site-level stats created by rules in 08-pixy.rules
+PIXY_STATS = ['pi','tajima_d']
+
+
+def _ploidies():
+	"""Return list of ploidies. Prefer checkpoint-generated file, otherwise fallback to [2,4]."""
+	pfile = os.path.join('results', 'pixy', 'vcfs_by_ploidy', 'ploidies.txt')
+	if os.path.exists(pfile):
+		with open(pfile) as fh:
+			pls = [l.strip() for l in fh if l.strip()]
+		if pls:
+			return pls
+	# fallback (common case: diploid and tetraploid)
+	return ['2','4']
+
+
+def _site_merge_path(ploidy, stat):
+	return f"results/pixy/{ploidy}/pixy_sitelevel_{stat}_merged.tsv.gz"
+
+
+def _fourfold_out(ploidy, stat):
+	return f"results/publication/{ploidy}/pixy_sitelevel_{stat}_4fold.tsv.gz"
+
+
+def _per_sample_out(ploidy):
+	return f"results/publication/{ploidy}/pixy_4fold_per_sample_summary.tsv"
+
+
+rule all:
+	input:
+		# filtered 4-fold per-stat files
+		lambda wildcards: [
+			_fourfold_out(p, s)
+			for p in _ploidies()
+			for s in PIXY_STATS
+		],
+		# per-ploidy population summaries
+		lambda wildcards: [f"results/publication/{p}/pixy_4fold_summary.tsv" for p in _ploidies()],
+		# per-ploidy per-sample summaries
+		lambda wildcards: [_per_sample_out(p) for p in _ploidies()],
+		DEGEN_FOUR
+
+
+rule filter_pixy_to_4fold:
+	"""Filter merged pixy site-level outputs to 4-fold degenerate sites for each ploidy and statistic.
+
+	Input: merged site-level pixy file (gzipped TSV) produced by merge_pixy_sitelevel_by_stat in 08-pixy.rules
+	Output: gzipped TSV limited to sites overlapping the four-fold bed
+	"""
+	input:
+		merged=lambda wildcards: _site_merge_path(wildcards.ploidy, wildcards.stat),
+		deg4=DEGEN_FOUR
+	output:
+		out=lambda wildcards: _fourfold_out(wildcards.ploidy, wildcards.stat)
+	params:
+		ploidy=lambda wildcards: wildcards.ploidy,
+		stat=lambda wildcards: wildcards.stat
+	run:
+		import pandas as pd
+		import gzip
+		import os
+
+		merged = input.merged
+		deg4 = input.deg4
+		outpath = output[0]
+		os.makedirs(os.path.dirname(outpath), exist_ok=True)
+
+		# read degenerate fourfold bed into per-chromosome interval lists
+		intervals = {}
+		if os.path.exists(deg4):
+			with open(deg4) as fh:
+				for line in fh:
+					cols = line.strip().split('\t')
+					if len(cols) < 3:
+						continue
+					chrom = cols[0]
+					try:
+						start = int(cols[1])
+						end = int(cols[2])
+					except Exception:
+						continue
+					intervals.setdefault(chrom, []).append((start, end))
+			# sort intervals for binary search
+			for chrom in intervals:
+				intervals[chrom].sort()
+
+		# flexible column detection for pixy site files
+		if not os.path.exists(merged):
+			# try uncompressed alternative
+			alt = merged.replace('.gz','')
+			if os.path.exists(alt):
+				merged = alt
+			else:
+				# write empty gz file and exit
+				pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
+				return
+
+		# read pixy merged site-level file
+		try:
+			if merged.endswith('.gz'):
+				df = pd.read_csv(merged, sep='\t', compression='gzip', low_memory=False)
+			else:
+				df = pd.read_csv(merged, sep='\t', low_memory=False)
+		except Exception:
+			# fallback: empty output
+			pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
+			return
+
+		if df.empty:
+			pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
+			return
+
+		# detect chrom and position columns
+		chrom_cols = [c for c in df.columns if c.lower() in ('chrom','chromosome','chr')]
+		pos_cols = [c for c in df.columns if c.lower() in ('position','pos','site','coordinate','coord')]
+		if chrom_cols:
+			chrom_col = chrom_cols[0]
+		elif 'CHROM' in df.columns:
+			chrom_col = 'CHROM'
+		else:
+			chrom_col = df.columns[0]
+		if pos_cols:
+			pos_col = pos_cols[0]
+		elif 'position' in df.columns:
+			pos_col = 'position'
+		elif 'POS' in df.columns:
+			pos_col = 'POS'
+		else:
+			# try second column
+			pos_col = df.columns[1] if len(df.columns) > 1 else None
+
+		if pos_col is None:
+			# cannot determine position column; output empty
+			pd.DataFrame().to_csv(outpath, sep='\t', index=False, compression='gzip')
+			return
+
+		# ensure position is integer
+		df[pos_col] = pd.to_numeric(df[pos_col], errors='coerce')
+		df = df.dropna(subset=[pos_col])
+		df[pos_col] = df[pos_col].astype(int)
+
+		# function to test if a position overlaps any deg4 interval for a chrom
+		def pos_in_deg4(chrom, pos):
+			if chrom not in intervals:
+				return False
+			# bed is 0-based start, end exclusive: convert to 1-based coord test
+			for (s,e) in intervals[chrom]:
+				if (pos >= s+1) and (pos <= e):
+					return True
+			return False
+
+		mask = df.apply(lambda row: pos_in_deg4(str(row[chrom_col]), int(row[pos_col])), axis=1)
+		outdf = df.loc[mask]
+
+		# write gzipped TSV
+		outdf.to_csv(outpath, sep='\t', index=False, compression='gzip')
+
+
+rule summarize_pixy_4fold_by_pop:
+	"""Summarize 4-fold pixy site-level stats per population for each ploidy.
+
+	Produces a small TSV with per-population mean and sd for pi and Tajima's D (if available).
+	"""
+	input:
+		pi=lambda wildcards: _fourfold_out(wildcards.ploidy, 'pi'),
+		taj=lambda wildcards: _fourfold_out(wildcards.ploidy, 'tajima_d'),
+		pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt"
+	output:
+		f="results/publication/{{ploidy}}/pixy_4fold_summary.tsv"
+	params:
+		stat_pi='pi', stat_taj='tajima_d'
+	run:
+		import pandas as pd
+		import os
+		os.makedirs(os.path.dirname(output.f), exist_ok=True)
+
+		# read populations file if present (sample\tpop)
+		popmap = None
+		if os.path.exists(input.pops):
+			try:
+				popmap = pd.read_csv(input.pops, sep='\t', header=None, names=['sample','pop'], dtype=str)
+			except Exception:
+				popmap = None
+
+		# read pi and tajima files (may be empty)
+		def safe_read(p):
+			if not os.path.exists(p):
+				p_alt = p.replace('.gz','')
+				if os.path.exists(p_alt):
+					p = p_alt
+				else:
+					return pd.DataFrame()
+			try:
+				if str(p).endswith('.gz'):
+					return pd.read_csv(p, sep='\t', compression='gzip', low_memory=False)
+				else:
+					return pd.read_csv(p, sep='\t', low_memory=False)
+			except Exception:
+				return pd.DataFrame()
+
+		df_pi = safe_read(input.pi)
+		df_taj = safe_read(input.taj)
+
+		# Attempt to find a population column in the pixy outputs
+		popcol = None
+		for df in (df_pi, df_taj):
+			if df is None or df.empty:
+				continue
+			for c in df.columns:
+				if c.lower() in ('pop','population'):
+					popcol = c
+					break
+			if popcol:
+				break
+
+		# fallback: if popcol is missing but popmap exists, assume pixy outputs per-site per-pop with a column 'pop'
+		if popcol is None and popmap is not None:
+			# try to infer by intersecting pop names with dataframe column names
+			popnames = set(popmap['pop'].unique())
+			cand = [c for c in df_pi.columns if str(c) in popnames]
+			if cand:
+				# create melted dataframe
+				melted = df_pi.melt(id_vars=[c for c in df_pi.columns if c not in cand], value_vars=cand, var_name='pop', value_name='pi')
+				df_pi = melted
+				popcol = 'pop'
+
+		# create summary table
+		rows = []
+		if popcol and not df_pi.empty:
+			pi_col_candidates = [c for c in df_pi.columns if c.lower() == 'pi' or c.lower().endswith('.pi')]
+			pi_col = pi_col_candidates[0] if pi_col_candidates else None
+			# ensure pi numeric
+			if pi_col is None:
+				# try to detect numeric columns not coordinates
+				numeric_cols = [c for c in df_pi.columns if pd.api.types.is_numeric_dtype(df_pi[c])]
+				# exclude position/chrom
+				numeric_cols = [c for c in numeric_cols if c.lower() not in ('position','pos','start','end')]
+				pi_col = numeric_cols[0] if numeric_cols else None
+
+			if pi_col:
+				grp = df_pi.groupby(popcol)[pi_col].agg(['count','mean','std']).reset_index()
+				grp = grp.rename(columns={'count':'n_sites','mean':'mean_pi','std':'sd_pi','pop':popcol})
+				# merge tajima if possible
+				if not df_taj.empty and popcol in df_taj.columns:
+					taj_col_candidates = [c for c in df_taj.columns if c.lower() in ('tajima_d','tajima') or c.lower().endswith('.tajima_d')]
+					taj_col = taj_col_candidates[0] if taj_col_candidates else None
+					if taj_col is None:
+						tnumeric = [c for c in df_taj.columns if pd.api.types.is_numeric_dtype(df_taj[c])]
+						tnumeric = [c for c in tnumeric if c.lower() not in ('position','pos','start','end')]
+						taj_col = tnumeric[0] if tnumeric else None
+					if taj_col:
+						tgrp = df_taj.groupby(popcol)[taj_col].agg(['mean','std']).reset_index()
+						tgrp = tgrp.rename(columns={'mean':'mean_tajima_d','std':'sd_tajima_d', popcol:popcol})
+						merged = pd.merge(grp, tgrp, on=popcol, how='left')
+					else:
+						merged = grp
+				else:
+					merged = grp
+				merged.to_csv(output.f, sep='\t', index=False)
+				return
+
+		# If we couldn't compute per-population summaries, compute global summary
+		import numpy as np
+		def global_stats(df, stat_name):
+			if df is None or df.empty:
+				return {'n_sites':0, f'mean_{stat_name}':np.nan, f'sd_{stat_name}':np.nan}
+			numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+			numeric_cols = [c for c in numeric_cols if c.lower() not in ('position','pos','start','end')]
+			if not numeric_cols:
+				return {'n_sites':0, f'mean_{stat_name}':np.nan, f'sd_{stat_name}':np.nan}
+			col = numeric_cols[0]
+			vals = df[col].dropna().values
+			return {'n_sites':len(vals), f'mean_{stat_name}':float(np.mean(vals)) if len(vals) else float('nan'), f'sd_{stat_name}':float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0}
+
+		gpi = global_stats(df_pi, 'pi')
+		gtaj = global_stats(df_taj, 'tajima_d')
+		outdf = pd.DataFrame([{
+			'pop':'ALL',
+			'n_sites': gpi['n_sites'],
+			'mean_pi': gpi['mean_pi'],
+			'sd_pi': gpi['sd_pi'],
+			'mean_tajima_d': gtaj['mean_tajima_d'],
+			'sd_tajima_d': gtaj['sd_tajima_d']
+		}])
+		outdf.to_csv(output.f, sep='\t', index=False)
+
+
+rule summarize_pixy_4fold_by_sample:
+	"""Summarize 4-fold pixy site-level stats per individual sample for each ploidy.
+
+	Produces a TSV with columns: sample, pop (if available), n_sites, mean_pi, sd_pi, mean_tajima_d, sd_tajima_d
+	"""
+	input:
+		pi=lambda wildcards: _fourfold_out(wildcards.ploidy, 'pi'),
+		taj=lambda wildcards: _fourfold_out(wildcards.ploidy, 'tajima_d'),
+		pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt"
+	output:
+		f="results/publication/{ploidy}/pixy_4fold_per_sample_summary.tsv"
+	run:
+		import pandas as pd
+		import os
+		os.makedirs(os.path.dirname(output.f), exist_ok=True)
+
+		# load populations mapping if available (sample\tpop)
+		popmap = None
+		if os.path.exists(input.pops):
+			try:
+				popmap = pd.read_csv(input.pops, sep='\t', header=None, names=['sample','pop'], dtype=str)
+			except Exception:
+				popmap = None
+
+		def safe_read(p):
+			if not os.path.exists(p):
+				p_alt = p.replace('.gz','')
+				if os.path.exists(p_alt):
+					p = p_alt
+				else:
+					return pd.DataFrame()
+			try:
+				if str(p).endswith('.gz'):
+					return pd.read_csv(p, sep='\t', compression='gzip', low_memory=False)
+				else:
+					return pd.read_csv(p, sep='\t', low_memory=False)
+			except Exception:
+				return pd.DataFrame()
+
+		df_pi = safe_read(input.pi)
+		df_taj = safe_read(input.taj)
+
+		# detect sample column in pixy site outputs: pixy site outputs sometimes include a 'sample' or 'sample_id' column
+		sample_col = None
+		for df in (df_pi, df_taj):
+			if df is None or df.empty:
+				continue
+			for c in df.columns:
+				if c.lower() in ('sample','sample_id'):
+					sample_col = c
+					break
+			if sample_col:
+				break
+
+		# If no sample column, but popmap exists, we can try to infer per-sample values by matching sample-specific columns
+		if sample_col is None and popmap is not None and not df_pi.empty:
+			sample_names = set(popmap['sample'].unique())
+			cand = [c for c in df_pi.columns if str(c) in sample_names]
+			if cand:
+				id_vars = [c for c in df_pi.columns if c not in cand]
+				df_pi = df_pi.melt(id_vars=id_vars, value_vars=cand, var_name='sample', value_name='pi')
+				sample_col = 'sample'
+
+		# If still no sample column, we cannot compute per-sample stats; write empty file
+		if sample_col is None:
+			pd.DataFrame().to_csv(output.f, sep='\t', index=False)
+			return
+
+		# aggregate per sample
+		import numpy as np
+		out_rows = []
+		# choose numeric columns for pi and taj
+		pi_col = None
+		if 'pi' in df_pi.columns:
+			pi_col = 'pi'
+		else:
+			numcols = [c for c in df_pi.columns if pd.api.types.is_numeric_dtype(df_pi[c])]
+			numcols = [c for c in numcols if c.lower() not in ('position','pos','start','end')]
+			if numcols:
+				pi_col = numcols[0]
+
+		taj_col = None
+		if 'tajima_d' in df_taj.columns:
+			taj_col = 'tajima_d'
+		else:
+			tnum = [c for c in df_taj.columns if pd.api.types.is_numeric_dtype(df_taj[c])]
+			tnum = [c for c in tnum if c.lower() not in ('position','pos','start','end')]
+			if tnum:
+				taj_col = tnum[0]
+
+		samples = sorted(set(df_pi[sample_col].dropna().astype(str).unique()))
+		for s in samples:
+			row = {'sample': s}
+			subpi = df_pi.loc[df_pi[sample_col].astype(str) == s]
+			if not subpi.empty and pi_col:
+				vals = pd.to_numeric(subpi[pi_col], errors='coerce').dropna().values
+				row['n_sites'] = int(len(vals))
+				row['mean_pi'] = float(np.mean(vals)) if len(vals) else float('nan')
+				row['sd_pi'] = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+			else:
+				row['n_sites'] = 0; row['mean_pi'] = float('nan'); row['sd_pi'] = float('nan')
+
+			if taj_col and not df_taj.empty:
+				subt = df_taj.loc[df_taj[sample_col].astype(str) == s]
+				if not subt.empty:
+					tvals = pd.to_numeric(subt[taj_col], errors='coerce').dropna().values
+					row['mean_tajima_d'] = float(np.mean(tvals)) if len(tvals) else float('nan')
+					row['sd_tajima_d'] = float(np.std(tvals, ddof=1)) if len(tvals) > 1 else 0.0
+				else:
+					row['mean_tajima_d'] = float('nan'); row['sd_tajima_d'] = float('nan')
+			else:
+				row['mean_tajima_d'] = float('nan'); row['sd_tajima_d'] = float('nan')
+
+			out_rows.append(row)
+
+		outdf = pd.DataFrame(out_rows)
+		# attach pop if popmap exists
+		if popmap is not None and not popmap.empty:
+			outdf = outdf.merge(popmap, on='sample', how='left')
+
+		outdf.to_csv(output.f, sep='\t', index=False)
+

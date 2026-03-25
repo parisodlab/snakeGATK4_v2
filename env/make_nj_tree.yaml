@@ -1,0 +1,22 @@
+name: make_nj_tree
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base=4.2.2
+  - r-vcfr
+  - r-stampp
+  - r-adegenet
+  - r-ape
+  - bioconductor-snprelate
+  - r-tidyverse
+  - bioconductor-treeio
+  - bioconductor-ggtree
+  - bioconda::r-dartr
+  - r-devtools
+  - zlib
+  - libxml2
+  - libcurl
+  - gcc_linux-64
+  - gxx_linux-64
