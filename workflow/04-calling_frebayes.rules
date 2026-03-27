@@ -1,0 +1,319 @@
+import os
+import shlex
+
+import pandas as pd
+
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"], sep="\t")
+
+if "sample_lane" not in samples.columns:
+    if {"sample", "lane", "sample_barcode"}.issubset(samples.columns):
+        samples["sample_lane"] = (
+            samples["sample"].astype(str)
+            + "_"
+            + samples["lane"].astype(str)
+            + "_"
+            + samples["sample_barcode"].astype(str)
+        )
+    elif {"sample", "lane"}.issubset(samples.columns):
+        samples["sample_lane"] = samples["sample"].astype(str) + "_" + samples["lane"].astype(str)
+    elif "prefix" in samples.columns:
+        samples["sample_lane"] = samples["prefix"].astype(str)
+    else:
+        raise ValueError(
+            "METAFILE must contain 'sample_lane' or ('sample' and 'lane' [and optionally 'sample_barcode']) or 'prefix'"
+        )
+
+samples["prefix"] = samples["sample_lane"].astype(str)
+samples = samples.set_index(["prefix"], drop=False)
+
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+OUTDIR = os.path.join(final_path, "freebayes")
+LOGS_DIR = os.path.join(str(config.get("log_folder", "logs")), "freebayes")
+GENOME = config["GENOME"]
+SCAFFS = config["SCAFFOLDS"]
+
+SEQTYPE = str(config.get("SEQTYPE", "wgs")).strip().lower()
+if SEQTYPE not in {"wgs", "ddrad"}:
+    raise ValueError(f"Invalid SEQTYPE={SEQTYPE!r}. Expected 'wgs' or 'ddrad'.")
+
+ANALYSIS_BAM_SUBDIR = "merged_samples" if SEQTYPE == "ddrad" else "dedup"
+ANALYSIS_BAM_PATTERN = os.path.join(final_path, ANALYSIS_BAM_SUBDIR, "{sample}.bam")
+ANALYSIS_BAI_PATTERN = os.path.join(final_path, ANALYSIS_BAM_SUBDIR, "{sample}.bam.bai")
+
+sample_names = sorted(samples["sample"].astype(str).dropna().unique().tolist())
+scaffolds = []
+
+if SCAFFS == "ALL":
+    fai = GENOME + ".fai"
+    if os.path.exists(fai):
+        with open(fai, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    scaffolds.append(line.split("\t", 1)[0])
+    else:
+        with open(GENOME, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith(">"):
+                    scaffolds.append(line.split(" ")[0][1:])
+else:
+    with open(SCAFFS, "rt", encoding="utf-8") as sh:
+        for line in sh:
+            line = line.strip()
+            if line:
+                scaffolds.append(line)
+
+if not sample_names:
+    raise ValueError("No samples found in METAFILE.")
+if not scaffolds:
+    raise ValueError("No scaffolds available for FreeBayes calling.")
+
+FREEBAYES_CFG = config.get("FreeBayes", {})
+FILTERING_CFG = config.get("VariantFiltering", {})
+FREEBAYES_SITE_FILTER_CFG = FILTERING_CFG.get("freebayes_site_filter", {})
+
+
+def _normalize_ploidy(value):
+    if pd.isna(value):
+        return None
+    value_str = str(value).strip().lower()
+    if not value_str:
+        return None
+    alias_map = {
+        "diploid": 2,
+        "tetraploid": 4,
+        "haploid": 1,
+    }
+    if value_str in alias_map:
+        return alias_map[value_str]
+    try:
+        return int(float(value_str))
+    except ValueError as exc:
+        raise ValueError(f"Unsupported ploidy value for FreeBayes: {value!r}") from exc
+
+
+def _configured_default_ploidy():
+    configured = FREEBAYES_CFG.get("ploidy", config.get("PLOIDY"))
+    if configured is None:
+        return None
+    return _normalize_ploidy(configured)
+
+
+def _sample_ploidy_map():
+    default_ploidy = _configured_default_ploidy()
+    if "ploidy" not in samples.columns:
+        fallback = default_ploidy if default_ploidy is not None else 2
+        return {sample_name: fallback for sample_name in sample_names}
+
+    ploidy_records = samples[["sample", "ploidy"]].copy()
+    ploidy_records["ploidy_norm"] = ploidy_records["ploidy"].map(_normalize_ploidy)
+    ploidy_map = {}
+    for sample_name, group in ploidy_records.groupby("sample"):
+        unique_values = sorted({value for value in group["ploidy_norm"].tolist() if value is not None})
+        if len(unique_values) > 1:
+            raise ValueError(
+                f"Sample {sample_name!r} has inconsistent ploidy assignments in METAFILE: {unique_values}"
+            )
+        if unique_values:
+            ploidy_map[str(sample_name)] = unique_values[0]
+        elif default_ploidy is not None:
+            ploidy_map[str(sample_name)] = default_ploidy
+        else:
+            raise ValueError(
+                f"Sample {sample_name!r} has no ploidy in METAFILE. Set FreeBayes.ploidy as the default/fallback ploidy."
+            )
+    return ploidy_map
+
+
+def freebayes_param_str(params_dict):
+    parts = []
+    for key, value in (params_dict or {}).items():
+        if isinstance(value, bool):
+            if value:
+                parts.append(str(key))
+            continue
+        value_str = str(value).strip()
+        if not value_str or value_str.lower() in {"false", "none", "null"}:
+            continue
+        if value_str.lower() == "true":
+            parts.append(str(key))
+        else:
+            parts.append(f"{key} {shlex.quote(value_str)}")
+    return " ".join(parts)
+
+
+SAMPLE_PLOIDY = _sample_ploidy_map()
+DEFAULT_PLOIDY = _configured_default_ploidy()
+if DEFAULT_PLOIDY is None:
+    DEFAULT_PLOIDY = max(set(SAMPLE_PLOIDY.values()), key=list(SAMPLE_PLOIDY.values()).count)
+THETA = FREEBAYES_CFG.get("theta", 0.001)
+MAX_COMPLEX_GAP = FREEBAYES_CFG.get("max_complex_gap", -1)
+USE_BEST_N_ALLELES = FREEBAYES_CFG.get("use_best_n_alleles", 32)
+MIN_BASE_QUALITY = FREEBAYES_CFG.get("min_base_quality", 20)
+MIN_MAPPING_QUALITY = FREEBAYES_CFG.get("min_mapping_quality", 20)
+MIN_FILTER_QUAL = float(FREEBAYES_SITE_FILTER_CFG.get("min_qual", 1.0))
+MIN_FILTER_SAF = int(FREEBAYES_SITE_FILTER_CFG.get("min_saf", 1))
+MIN_FILTER_SAR = int(FREEBAYES_SITE_FILTER_CFG.get("min_sar", 1))
+MIN_FILTER_RPR = int(FREEBAYES_SITE_FILTER_CFG.get("min_rpr", 2))
+MIN_FILTER_RPL = int(FREEBAYES_SITE_FILTER_CFG.get("min_rpl", 2))
+FREEBAYES_EXTRA_PARAMS = freebayes_param_str(config.get("freebayes_params", {}))
+
+BASE_FREEBAYES_PARAMS = [
+    f"--ploidy {DEFAULT_PLOIDY}",
+    f"--theta {THETA}",
+    f"--max-complex-gap {MAX_COMPLEX_GAP}",
+    f"--use-best-n-alleles {USE_BEST_N_ALLELES}",
+    f"--min-base-quality {MIN_BASE_QUALITY}",
+    f"--min-mapping-quality {MIN_MAPPING_QUALITY}",
+    "--min-repeat-entropy 1",
+    "--no-partial-observations",
+    "--report-genotype-likelihood-max",
+    "--no-population-priors",
+    "--report-monomorphic",
+    "--genotype-qualities",
+]
+if FREEBAYES_EXTRA_PARAMS:
+    BASE_FREEBAYES_PARAMS.append(FREEBAYES_EXTRA_PARAMS)
+FREEBAYES_CMD_PARAMS = " ".join(BASE_FREEBAYES_PARAMS)
+
+
+wildcard_constraints:
+    sample = "[^/]+",
+    scaffold = "[^/]+"
+
+
+rule all:
+    default_target: True
+    input:
+        os.path.join(OUTDIR, "final_vcf", "filtered.vcf.gz"),
+        os.path.join(OUTDIR, "final_vcf", "filtered.vcf.gz.tbi")
+
+
+rule write_freebayes_inputs:
+    input:
+        bams=expand(ANALYSIS_BAM_PATTERN, sample=sample_names),
+        bais=expand(ANALYSIS_BAI_PATTERN, sample=sample_names)
+    output:
+        bamlist=os.path.join(OUTDIR, "bam.list"),
+        pops=os.path.join(OUTDIR, "populations.tsv"),
+        cnv_map=os.path.join(OUTDIR, "sample_copy_number.tsv")
+    run:
+        os.makedirs(os.path.dirname(output.bamlist), exist_ok=True)
+        pop_series = samples[["sample"]].drop_duplicates().copy()
+        if "pop" in samples.columns:
+            pop_map = samples.groupby("sample")["pop"].first()
+        elif "population" in samples.columns:
+            pop_map = samples.groupby("sample")["population"].first()
+        else:
+            pop_map = None
+
+        if pop_map is None:
+            pop_series["pop"] = "NA"
+        else:
+            pop_series["pop"] = pop_series["sample"].map(pop_map).fillna("NA")
+
+        with open(output.bamlist, "wt", encoding="utf-8") as bam_fh:
+            for sample_name in sample_names:
+                bam_fh.write(ANALYSIS_BAM_PATTERN.format(sample=sample_name) + "\n")
+
+        pop_series[["sample", "pop"]].to_csv(output.pops, sep="\t", header=False, index=False)
+        with open(output.cnv_map, "wt", encoding="utf-8") as cnv_fh:
+            for sample_name in sample_names:
+                cnv_fh.write(f"{sample_name}\t{SAMPLE_PLOIDY[sample_name]}\n")
+
+
+rule freebayes_scaffold:
+    input:
+        bam_list=os.path.join(OUTDIR, "bam.list"),
+        cnv_map=os.path.join(OUTDIR, "sample_copy_number.tsv"),
+        ref=GENOME,
+        ref_fai=GENOME + ".fai",
+        bams=expand(ANALYSIS_BAM_PATTERN, sample=sample_names),
+        bais=expand(ANALYSIS_BAI_PATTERN, sample=sample_names)
+    output:
+        vcf=os.path.join(OUTDIR, "vcf", "fbregion-{scaffold}.vcf.gz"),
+        tbi=os.path.join(OUTDIR, "vcf", "fbregion-{scaffold}.vcf.gz.tbi")
+    conda:
+        "../env/freebayes_calling_env.yaml"
+    log:
+        os.path.join(LOGS_DIR, "freebayes_{scaffold}.log")
+    params:
+        cmd=FREEBAYES_CMD_PARAMS
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p $(dirname {output.vcf})
+        mkdir -p $(dirname {log})
+
+        freebayes \
+            --region {wildcards.scaffold} \
+            --fasta-reference {input.ref} \
+            --cnv-map {input.cnv_map} \
+            {params.cmd} \
+            --bam-list {input.bam_list} \
+            2> {log} \
+        | bgzip -c > {output.vcf}
+
+        tabix -f -p vcf {output.vcf} &>> {log}
+        """
+
+
+rule concat_freebayes_vcfs:
+    input:
+        vcfs=expand(os.path.join(OUTDIR, "vcf", "fbregion-{scaffold}.vcf.gz"), scaffold=scaffolds),
+        tbis=expand(os.path.join(OUTDIR, "vcf", "fbregion-{scaffold}.vcf.gz.tbi"), scaffold=scaffolds)
+    output:
+        raw=os.path.join(OUTDIR, "final_vcf", "raw.vcf.gz"),
+        raw_tbi=os.path.join(OUTDIR, "final_vcf", "raw.vcf.gz.tbi")
+    conda:
+        "../env/freebayes_calling_env.yaml"
+    log:
+        os.path.join(LOGS_DIR, "concat_freebayes.log")
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p $(dirname {output.raw})
+        mkdir -p $(dirname {log})
+
+        bcftools concat --allow-overlaps --rm-dups all -O z -o {output.raw} {input.vcfs} &> {log}
+        tabix -f -p vcf {output.raw} &>> {log}
+        """
+
+
+rule filter_freebayes:
+    input:
+        raw=os.path.join(OUTDIR, "final_vcf", "raw.vcf.gz"),
+        raw_tbi=os.path.join(OUTDIR, "final_vcf", "raw.vcf.gz.tbi"),
+        ref=GENOME
+    output:
+        filtered=os.path.join(OUTDIR, "final_vcf", "filtered.vcf.gz"),
+        filtered_tbi=os.path.join(OUTDIR, "final_vcf", "filtered.vcf.gz.tbi")
+    conda:
+        "../env/freebayes_calling_env.yaml"
+    log:
+        os.path.join(LOGS_DIR, "filter_freebayes.log")
+    params:
+        min_qual=MIN_FILTER_QUAL,
+        min_saf=MIN_FILTER_SAF,
+        min_sar=MIN_FILTER_SAR,
+        min_rpr=MIN_FILTER_RPR,
+        min_rpl=MIN_FILTER_RPL
+    shell:
+        """
+        set -euo pipefail
+        mkdir -p $(dirname {output.filtered})
+        mkdir -p $(dirname {log})
+
+        (
+            bcftools view --trim-alt-alleles --exclude-uncalled -O u {input.raw} \
+            | bcftools filter -e 'QUAL<={params.min_qual} || SAF<{params.min_saf} || SAR<{params.min_sar} || RPR<{params.min_rpr} || RPL<{params.min_rpl}' -O u \
+            | bcftools norm --fasta-ref {input.ref} -O z -o {output.filtered}
+        ) &> {log}
+
+        tabix -f -p vcf {output.filtered} &>> {log}
+        """
+
+

@@ -16,10 +16,61 @@ The main user-controlled file is [config_main.yaml](config_main.yaml).
 The pipeline entry point is [main_pipeline.py](main_pipeline.py).
 
 ```bash
-python main_pipeline.py
+python main_pipeline.py --stages mapping,calling_gatk,vcf_annotation,filter_vcf --profile slurm
+python main_pipeline.py --caller freebayes --profile slurm
 ```
 
-At present, [main_pipeline.py](main_pipeline.py) launches mapping and the GATK calling stage directly. Other workflow stages are driven from the Snakemake rules and downstream targets.
+You can also run any stage directly with Snakemake (recommended for debugging):
+
+```bash
+snakemake -s workflow/03-mapping.rules --configfile config_main.yaml --profile slurm
+snakemake -s workflow/04-calling_gatk4.rules --configfile config_main.yaml --profile slurm
+snakemake -s workflow/04-calling_freebayes.rules --configfile config_main.yaml --profile slurm
+snakemake -s workflow/05-filter_vcf_gatk4.rules --configfile config_main.yaml --profile slurm
+snakemake -s workflow/05-filter_vcf_freebayes.rules --configfile config_main.yaml --profile slurm
+snakemake -s workflow/00-vcf_annotation.rules --configfile config_main.yaml --profile slurm
+```
+
+### Stage Names
+
+[main_pipeline.py](main_pipeline.py) runs one or more named stages. Each stage corresponds to a single rules file under `workflow/`:
+
+- `qc` → `workflow/01-quality_control.rules`
+- `trim` → `workflow/02-trim.rules`
+- `mapping` → `workflow/03-mapping.rules`
+- `calling_gatk` → `workflow/04-calling_gatk4.rules`
+- `calling_gatk4` → `workflow/04-calling_gatk4.rules`
+- `calling_freebayes` → `workflow/04-calling_freebayes.rules`
+- `filter_vcf_gatk` → `workflow/05-filter_vcf_gatk4.rules`
+- `filter_vcf_gatk4` → `workflow/05-filter_vcf_gatk4.rules`
+- `filter_vcf_freebayes` → `workflow/05-filter_vcf_freebayes.rules`
+- `vcf_annotation` → `workflow/00-vcf_annotation.rules`
+- `structure` → `workflow/07-structure_analysis.rules`
+- `pixy` → `workflow/08-pixy.rules`
+- `piawka` → `workflow/09-piawka_mixed_ploidy.rules`
+- `publication_ready` → `workflow/10-publication_ready.rules`
+- `popgen_investigate` → `workflow/11-popgen_inversitgate.rules`
+
+The launcher also accepts a caller alias:
+
+- `--caller gatk` uses default stages `mapping,calling_gatk,vcf_annotation,filter_vcf`
+- `--caller freebayes` uses default stages `mapping,calling_freebayes,vcf_annotation,filter_vcf`
+- if you specify `--stages calling`, the launcher resolves that alias to the selected caller-specific stage
+- if you specify `--stages filter_vcf`, the launcher resolves that alias to the selected caller-specific filtering stage
+
+For compatibility, the older stage names `calling_gatk4` and `filter_vcf_gatk4` still work, but `calling_gatk` and `filter_vcf_gatk` remain valid launcher-facing names.
+The numbered FreeBayes entrypoint is a thin wrapper around the canonical implementation file. Annotation is owned by `workflow/00-vcf_annotation.rules`.
+
+Default caller is read from `variant_caller` in `config_main.yaml` and falls back to `gatk`.
+
+### Dry Runs
+
+To build the DAG and validate configuration without executing jobs:
+
+```bash
+python main_pipeline.py --dry-run --stages mapping,calling_gatk -- --cores 1
+python main_pipeline.py --dry-run --caller freebayes -- --cores 1
+```
 
 ## Required Inputs
 
@@ -281,10 +332,29 @@ Change these settings when:
 - you work on problematic loci with many alternate alleles
 - you need to constrain complexity or runtime in dense regions
 
+Important fields:
+
+- `variant_caller`
+  - Used by `main_pipeline.py` to choose the default calling path.
+  - Set to `freebayes` if you want `python main_pipeline.py` to default to FreeBayes instead of GATK.
+
+- `FreeBayes.ploidy`
+  - Used as the default/fallback ploidy for samples missing a metadata ploidy.
+  - For mixed-ploidy datasets, the workflow generates a sample-level CNV map and passes it to FreeBayes with `--cnv-map`.
+
+- `freebayes_params`
+  - Optional extra CLI flags/arguments passed directly to FreeBayes.
+  - This uses the same dictionary style as the standalone germline FreeBayes pipeline.
+  - Boolean `true` values are emitted as flag-only parameters.
+
+FreeBayes outputs are written under `{FINALOUTPUT}/{PROJECT}/freebayes/final_vcf/`.
+Downstream rules now follow `variant_caller` automatically when `final_vcf`, `final_vcf_full`, and tool-specific `vcf` overrides are left unset.
+
 ### Downstream Analysis Blocks
 
 These sections mostly point to downstream resources and analysis preferences:
 
+- `final_vcf_neutral`
 - `final_vcf`
 - `final_vcf_full`
 - `Structure`
@@ -296,6 +366,65 @@ Change these when:
 - you produce a different final VCF target
 - you want a different Structure run mode or `K` range
 - you want different tree, outgroup, or Twisst settings
+
+## Downstream Output Locations (Stages 05–11)
+
+All downstream outputs are written beneath:
+
+- `{FINALOUTPUT}/{PROJECT}` (referred to as `final_path` inside the rules)
+
+Key directories:
+
+- **Stage 05 (filter VCF)**
+  - GATK outputs: `{final_path}/gatk4/final_vcf/`
+  - FreeBayes outputs: `{final_path}/freebayes/final_vcf/`
+  - Neutral SNP branch: `af_filtered.vcf.gz` → `4_fold_degenerate_filtered.vcf.gz` → `4_fold_degenerate_filtered.ld_pruned.vcf.gz`
+  - Broad popgen-stat branch: `filtered.vcf.gz` by default, or `af_filtered.vcf.gz` if `VariantFiltering.popgen_stats_use_af_filtered: true`
+  - Derived metadata (generated as tracked workflow outputs): `{final_path}/metadata/`
+    - Shared caller-agnostic outputs: `sample_pop_unique.tsv`, `sample_ploidy_unique.tsv`
+    - Additional GATK-specific QC and masking outputs remain under `{final_path}/gatk4/`
+
+- **Stage 07 (STRUCTURE + PCA)**
+  - Structure outputs: `{final_path}/structure/`
+  - PCA outputs: `{final_path}/pca/`
+  - Default neutral VCF follows `variant_caller` unless `final_vcf_neutral` or `final_vcf` is set.
+
+- **Stage 08 (pixy)**
+  - Outputs: `{final_path}/pixy/` (per-ploidy subdirectories)
+  - Default VCF follows `variant_caller` unless `final_vcf_full` or `final_vcf` is set.
+  - By default this uses the broad filtered VCF rather than the neutral-SNP branch.
+
+- **Stage 09 (piawka)**
+  - Outputs: `{final_path}/piawka/`
+  - Default VCF follows `variant_caller` unless `final_vcf_full` or `final_vcf` is set.
+  - By default this uses the broad filtered VCF rather than the neutral-SNP branch.
+
+## AF Filtering Options
+
+The shared filter behavior is configured under `VariantFiltering` in `config_main.yaml`:
+
+- `missingness_max`
+  - Maximum allowed `F_MISSING` fraction for the SNP-filtering branch.
+
+- `neutral_af_filter.enabled`
+  - Controls whether the neutral-SNP branch applies allele-frequency filtering before fourfold-site extraction.
+
+- `neutral_af_filter.min_af` / `neutral_af_filter.max_af`
+  - AF bounds for the neutral-SNP branch.
+
+- `popgen_stats_use_af_filtered`
+  - If `false` (recommended), pixy and piawka stay on the broader filtered VCF.
+  - If `true`, their default caller-following VCF becomes `af_filtered.vcf.gz`.
+
+- **Stage 10 (publication_ready)**
+  - Outputs: `{final_path}/publication/`
+  - Inputs expected to already exist:
+    - pixy merged site-level stats from stage 08 (e.g. `{final_path}/pixy/{ploidy}/pixy_sitelevel_pi_merged.tsv.gz`)
+    - 4-fold sites BED from stage 06 (`{final_path}/degeneracy/degeneracy-fourfold.bed`)
+
+- **Stage 11 (popgen_investigate)**
+  - Outputs: `{final_path}/popgen_investigate/`
+  - Default VCF follows `variant_caller` unless `popgen_investigate.vcf` or `final_vcf` is set.
 
 ## New QC Outputs
 
@@ -363,5 +492,7 @@ jointgenotyping_scatter_count: 10
 
 ## Notes
 
-- The repository currently still contains some older rule naming in [main_pipeline.py](main_pipeline.py), while the workflow files are organized as numbered rule files under `workflow/`.
-- If you want, the next useful cleanup would be to align [main_pipeline.py](main_pipeline.py) with the actual numbered rule filenames and document the expected execution order more explicitly.
+- The workflow supports mixed-ploidy calling by pulling per-sample ploidy from `METAFILE` (column `ploidy`). Ensure it is present and correct.
+- The QC/trim/mapping stages accept metadata in either lane-resolved form (`sample_lane`) or can reconstruct lane IDs from `sample + lane [+ sample_barcode]`.
+- The FreeBayes workflow uses the same BAM selection logic as GATK: `dedup/` for `SEQTYPE: wgs` and `merged_samples/` for `SEQTYPE: ddrad`.
+- The FreeBayes workflow now supports mixed-ploidy samples via a generated sample-level copy-number map (`--cnv-map`).

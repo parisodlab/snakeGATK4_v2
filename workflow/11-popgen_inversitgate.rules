@@ -21,29 +21,53 @@ configfile: "config_main.yaml"
 cfg = config.get('popgen_investigate', {})
 METAFILE = config.get('METAFILE')
 TREE     = cfg.get('tree', 'tree_unrooted.nwk')
-OUTDIR   = config["FINALOUTPUT"]+"/"+config["PROJECT"]+"/popgen_investigate"
-OUTGROUPS  = cfg.get('outgroups', None)
-VCF      = cfg.get('vcf', config["FINALOUTPUT"]+"/"+config["PROJECT"]+"/variants/filtered_variants.vcf.gz")
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+OUTDIR   = os.path.join(final_path, "popgen_investigate")
+OUTGROUPS = cfg.get('outgroups', []) or []
+VARIANT_CALLER = str(config.get("variant_caller", "gatk")).strip().lower()
 
-# create metadata, read metafile, subset on sample, pop, ploidy
-# write metadata with only sample, pop columns for tools that need it
-def write_metadata(file):
-    outmeta = os.path.dirname(OUTDIR)+"/metadata"
-    os.makedirs(outmeta, exist_ok=True)
-    outmetafile = outmeta+"/sample2pop.tsv"
-    df = pd.read_csv(file, sep="\t", dtype=str)
-    if 'sample' not in df.columns or 'pop' not in df.columns:
-        sys.exit("Error: metadata file must contain 'sample' and 'pop' columns.")
-    df = df[['sample', 'pop','ploidy']].dropna()
-    # deduplicate
-    df = df.drop_duplicates(subset=['sample'])
-    # ensure sample IDs are unique
-    if df['sample'].duplicated().any():
-        sys.exit("Error: duplicate sample IDs found in metadata.")
-    df[['sample','pop']].to_csv(outmetafile, sep="\t", index=False, header=True)
-    return outmeta+"/sample2pop.tsv"
 
-METADATA=write_metadata(METAFILE)
+def _caller_default_vcf():
+    if VARIANT_CALLER == "freebayes":
+        return os.path.join(final_path, "freebayes", "final_vcf", "filtered.vcf.gz")
+    return os.path.join(final_path, "gatk4", "final_vcf", "filtered.vcf.gz")
+
+# Prefer an explicitly provided VCF; otherwise fall back to the pipeline's filtered VCF.
+DEFAULT_VCF = _caller_default_vcf()
+VCF = cfg.get('vcf') or config.get('final_vcf') or DEFAULT_VCF
+
+METADATA_DIR = os.path.join(final_path, "metadata")
+METADATA = os.path.join(METADATA_DIR, "sample2pop.tsv")
+
+
+rule write_sample2pop:
+    """Write a simple sample<tab>pop mapping with a header.
+
+    This file is used by multiple downstream tools (Dsuite, etc.).
+    """
+    input:
+        metafile=METAFILE
+    output:
+        tsv=METADATA
+    run:
+        import pandas as pd
+        import os
+
+        if not input.metafile:
+            raise ValueError("config['METAFILE'] must be set")
+        df = pd.read_csv(input.metafile, sep='\t', dtype=str)
+        if 'sample' not in df.columns:
+            raise ValueError("METAFILE missing 'sample' column")
+        pop_col = 'pop' if 'pop' in df.columns else ('population' if 'population' in df.columns else None)
+        if pop_col is None:
+            raise ValueError("METAFILE missing 'pop' or 'population' column")
+
+        out = df[['sample', pop_col]].dropna().drop_duplicates(subset=['sample'])
+        out.columns = ['sample', 'pop']
+        if out['sample'].duplicated().any():
+            raise ValueError('duplicate sample IDs found in METAFILE after deduplication')
+        os.makedirs(os.path.dirname(output.tsv), exist_ok=True)
+        out.to_csv(output.tsv, sep='\t', index=False, header=True)
 
 rule all:
     input:
@@ -60,11 +84,12 @@ rule all:
 # metadata must be a tab-separated table with header containing at least: sampleID, population
 # Output format: two-column plain text: sampleID\tpopulation
 rule prepare_dsuite_sets:
+    input:
+        metadata=rules.write_sample2pop.output.tsv
     output:
         groups = f"{OUTDIR}/metadata/sample2set.tsv"
     params:
-        outgroups = ",".join(OUTGROUPS or []),
-        metadata = METADATA
+        outgroups = ",".join(OUTGROUPS),
     shell:
         """
         awk -v OG="{params.outgroups}" '
@@ -84,7 +109,7 @@ rule prepare_dsuite_sets:
             s=$sidx; p=$pidx; out=p;
             for(i=1;i<=n;i++){{ if(pats[i]!="" && s ~ ("^"pats[i])){{ out="Outgroup"; break }} }}
             print s, out
-        }}' {params.metadata} > {output.groups}
+        }}' {input.metadata} > {output.groups}
         """
 
 # Get unrooted tree, root it on samples that start with the letters in OUTGROUP 
@@ -94,10 +119,15 @@ rule root_tree:
     output:
         tree=f"{OUTDIR}/dsuite/rooted_tree.nwk"  # rooted tree
     params:
-        outgroups=OUTGROUPS
+        outgroups=",".join(OUTGROUPS)
     conda: "../env/make_nj_tree.yaml"
     shell:
         r"""
+        # If no outgroups are provided, keep the tree as-is.
+        if [ -z "{params.outgroups}" ]; then
+            cp {input.tree} {output.tree}
+            exit 0
+        fi
         Rscript -e '
         library(ape);
         # Load tree
@@ -133,8 +163,8 @@ rule dsuite_dtrios:
         """
         # Example: Dsuite Dtrios -c -o <prefix> <vcf> <groups>
         # -c : use genotype calls (if applicable). Remove or change flags for your VCF.
+        mkdir -p {params.outdir}
         ../scripts/Dsuite/Build/Dsuite Dtrios -c -o {params.outdir}/{params.prefix} {input.vcf} {input.groups}
-        # Dsuite produces several files; move/rename expected outputs
         """
 
 # # ---------------------------------------------------------------------------

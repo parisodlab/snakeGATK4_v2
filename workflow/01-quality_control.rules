@@ -1,15 +1,40 @@
 import pandas as pd
+
 configfile: "config_main.yaml"
 
-samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+samples = pd.read_csv(config["METAFILE"], sep="\t")
+
+# Normalize lane-level identifiers across the pipeline.
+# Prefer an explicit sample_lane column; otherwise reconstruct one.
+if "sample_lane" not in samples.columns:
+    if {"sample", "lane", "sample_barcode"}.issubset(samples.columns):
+        samples["sample_lane"] = (
+            samples["sample"].astype(str)
+            + "_"
+            + samples["lane"].astype(str)
+            + "_"
+            + samples["sample_barcode"].astype(str)
+        )
+    elif {"sample", "lane"}.issubset(samples.columns):
+        samples["sample_lane"] = samples["sample"].astype(str) + "_" + samples["lane"].astype(str)
+    elif "prefix" in samples.columns:
+        samples["sample_lane"] = samples["prefix"].astype(str)
+    else:
+        raise ValueError(
+            "METAFILE must contain 'sample_lane' or ('sample' and 'lane' [and optionally 'sample_barcode']) or 'prefix'"
+        )
+
+samples["prefix"] = samples["sample_lane"].astype(str)
+samples = samples.set_index(["prefix"], drop=False)
+
 final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
 
-sample=samples["sample"]
-prefix=samples["prefix"]
+sample = samples["sample"].astype(str).unique().tolist()
+prefix = samples["prefix"].astype(str).tolist()
 
 wildcard_constraints:
-    prefix = "|".join(samples.index),
-    sample = "|".join(samples["sample"])
+    prefix = "[^/]+",
+    sample = "[^/]+"
 
 
 

@@ -1,12 +1,37 @@
-import pandas as pd
 import os
-configfile: "/data/users/rchoudhury/snakeSNPcalling/config_main.yaml"
 
-samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+import pandas as pd
+
+configfile: "config_main.yaml"
+
+samples = pd.read_csv(config["METAFILE"], sep="\t")
+
+if "sample_lane" not in samples.columns:
+    if {"sample", "lane", "sample_barcode"}.issubset(samples.columns):
+        samples["sample_lane"] = (
+            samples["sample"].astype(str)
+            + "_"
+            + samples["lane"].astype(str)
+            + "_"
+            + samples["sample_barcode"].astype(str)
+        )
+    elif {"sample", "lane"}.issubset(samples.columns):
+        samples["sample_lane"] = samples["sample"].astype(str) + "_" + samples["lane"].astype(str)
+    elif "prefix" in samples.columns:
+        samples["sample_lane"] = samples["prefix"].astype(str)
+    else:
+        raise ValueError(
+            "METAFILE must contain 'sample_lane' or ('sample' and 'lane' [and optionally 'sample_barcode']) or 'prefix'"
+        )
+
+samples["prefix"] = samples["sample_lane"].astype(str)
+samples = samples.set_index(["prefix"], drop=False)
+
 final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
-temp_path = "results" + "/" + config["PROJECT"]
-sample=samples["sample"]
-prefix=samples["prefix"]
+TMPDIR = str(config.get("tmpdir", "tmp"))
+
+sample = samples["sample"].astype(str).unique().tolist()
+prefix = samples["prefix"].astype(str).tolist()
 
 # Sequencing type affects whether duplicate marking/removal is appropriate.
 # - wgs: run MarkDuplicates and use BAMs in /dedup downstream
@@ -17,10 +42,12 @@ if SEQTYPE not in {"wgs", "ddrad"}:
 ANALYSIS_BAM_SUBDIR = "merged_samples" if SEQTYPE == "ddrad" else "dedup"
 ANALYSIS_BAM_PATTERN = final_path + f"/{ANALYSIS_BAM_SUBDIR}/{{sample}}.bam"
 ANALYSIS_BAI_PATTERN = final_path + f"/{ANALYSIS_BAM_SUBDIR}/{{sample}}.bam.bai"
+MERGED_BAM_OUTPUT = final_path + "/merged_samples/{sample}.bam" if SEQTYPE == "ddrad" else temp(final_path + "/merged_samples/{sample}.bam")
+MERGED_BAI_OUTPUT = final_path + "/merged_samples/{sample}.bam.bai" if SEQTYPE == "ddrad" else temp(final_path + "/merged_samples/{sample}.bam.bai")
 
 wildcard_constraints:
-    prefix = "|".join(samples.index),
-    sample = "|".join(samples["sample"])
+    prefix = "[^/]+",
+    sample = "[^/]+"
 
 GENOME = config["GENOME"]
 TRIMMING = config["TRIMMING"]
@@ -30,8 +57,8 @@ if TRIMMING == "yes":
 else:
     print("Working on raw fastq files")
 
-units = pd.read_csv(config["METAFILE"],sep='\t')[["sample","prefix"]]
-dunits = units.groupby('sample').agg(lambda x: x.tolist()).to_dict('index')
+units = samples.reset_index(drop=True)[["sample", "prefix"]]
+dunits = units.groupby("sample").agg(lambda x: x.tolist()).to_dict("index")
 
 
 # Define a function to get the fastq files for a given prefix
@@ -46,8 +73,8 @@ def get_trimmed_fastq(wildcards):
 
 
 def get_read_group(wildcards):
-    lane = samples.loc[(wildcards.prefix),"lane"]
-    sampleid = samples.loc[(wildcards.prefix),"sample"]
+    lane = samples.loc[(wildcards.prefix), "lane"] if "lane" in samples.columns else "NA"
+    sampleid = samples.loc[(wildcards.prefix), "sample"]
     return {"lane":lane,"sampleid":sampleid}
 
 
@@ -81,13 +108,18 @@ rule mapping:
         lane=lambda wildcards : get_read_group(wildcards)['lane'],
         sampleid = lambda wildcards : get_read_group(wildcards)['sampleid'],
         platform = "illumina",
-        outputpath = temp_path + "/mapped"
+        tmpdir=TMPDIR
     shell:
        """ 
+        set -e
+
+        mkdir -p $(dirname {output.bam})
+        mkdir -p {params.tmpdir}
+
         bwa mem -t {threads} -R '@RG\\tID:{wildcards.prefix}\\tSM:{params.sampleid}\\tPL:ILLUMINA\\tPU:{params.sampleid}:{wildcards.prefix}:{params.lane}' {input.reference} {input.r1} {input.r2} | \
         sambamba view --nthreads={threads} --show-progress --sam-input --format=bam --with-header /dev/stdin | \
-        sambamba sort --nthreads={threads} --show-progress --tmpdir=tmp --out={params.outputpath}/{wildcards.prefix}.bam /dev/stdin
-        sambamba index --nthreads={threads} {params.outputpath}/{wildcards.prefix}.bam
+        sambamba sort --nthreads={threads} --show-progress --tmpdir={params.tmpdir} --out={output.bam} /dev/stdin
+        sambamba index --nthreads={threads} {output.bam}
 	
         """
 
@@ -96,8 +128,8 @@ rule MergeBamLanes:
     input:
         bamin = lambda wildcards: expand( final_path + "/mapped/{unit}.bam",unit=dunits[wildcards.sample]["prefix"])
     output:
-        out=temp(final_path  + "/merged_samples/{sample}.bam"),
-        bai=temp(final_path  + "/merged_samples/{sample}.bam.bai"),
+        out=MERGED_BAM_OUTPUT,
+        bai=MERGED_BAI_OUTPUT,
     benchmark:
         "benchmarks/merged/{sample}.txt"
     resources:
@@ -134,22 +166,29 @@ rule MarkDuplicates:
         mem_mb=20000,
         sample=4
     params:
-        outputpath = final_path + "/dedup"
+        tmpdir=TMPDIR
     conda:
         "../env/markduplicates.yaml"
     shell:
         """
-        picard -Xmx8g -Djava.io.tmpdir={resources.tmpdir} -Xms1g MarkDuplicates I={input.bam} O={params.outputpath}/{wildcards.sample}.bam \
-        M={params.outputpath}/{wildcards.sample}.duplicates.txt VALIDATION_STRINGENCY=SILENT \
-        REMOVE_DUPLICATES=false TAGGING_POLICY=All REMOVE_SEQUENCING_DUPLICATES=TRUE TMP_DIR={resources.tmpdir} \
-        SORTING_COLLECTION_SIZE_RATIO=0.1 TMP_DIR={resources.tmpdir} \
-        OPTICAL_DUPLICATE_PIXEL_DISTANCE=2500
-        sambamba index --nthreads={threads} {params.outputpath}/{wildcards.sample}.bam
+        set -e
+        mkdir -p $(dirname {output.bam})
+        mkdir -p {params.tmpdir}
+
+        picard -Xmx8g -Xms1g -Djava.io.tmpdir={params.tmpdir} MarkDuplicates \
+            I={input.bam} O={output.bam} \
+            M={output.metrics} VALIDATION_STRINGENCY=SILENT \
+            REMOVE_DUPLICATES=false TAGGING_POLICY=All REMOVE_SEQUENCING_DUPLICATES=TRUE \
+            SORTING_COLLECTION_SIZE_RATIO=0.1 TMP_DIR={params.tmpdir} \
+            OPTICAL_DUPLICATE_PIXEL_DISTANCE=2500
+
+        sambamba index --nthreads={threads} {output.bam}
         """
 
 rule CoverageReport:
     input:
-        bam=ANALYSIS_BAM_PATTERN
+        bam=ANALYSIS_BAM_PATTERN,
+        bai=ANALYSIS_BAI_PATTERN
     output:
         summ=final_path + "/coverage/{sample}_summaryStats.txt",
         bamtools=final_path + "/coverage/{sample}_bamtools_stats.txt"
@@ -178,12 +217,10 @@ rule genomeCov:
         final_path + "/coverage/bamcov/{sample}_coverage.txt"
     benchmark:
         "benchmarks/genomeCov/genomeCov_{sample}.txt"
-    params:
-        bamcov_path = "scripts/bamcov"
     shell:
         """
-        module add bzip2/1.0.8-GCCcore-10.3.0
-        {params.bamcov_path}/bamcov -m {input} -o {output}
+        mkdir -p $(dirname {output})
+        samtools coverage {input} > {output}
         """
 
 rule deeptoolsCov:
@@ -210,25 +247,33 @@ rule deeptoolsCov:
 
 rule goleftCov:
     input:
-        expand(ANALYSIS_BAM_PATTERN,sample=sample)
+        bams=expand(ANALYSIS_BAM_PATTERN, sample=sample),
+        bais=expand(ANALYSIS_BAI_PATTERN, sample=sample)
     output:
         ped=final_path + "/bamcoverage/goleft/report/report-indexcov.ped",
         roc=final_path + "/bamcoverage/goleft/report/report-indexcov.roc",
         html=directory(final_path + "/bamcoverage/goleft/report"),
     log:
         "indexcov.log",
-    params:
-        inbam=final_path + f"/{ANALYSIS_BAM_SUBDIR}/"
-    conda:
-        "../env/bamcoverage.yaml"
     shell:
         """
-        scripts/goleft indexcov --sex '' --directory {output.html} {params.inbam}*.bam
+        mkdir -p {output.html}
+        printf "sample\tsex\n" > {output.ped}
+        for bam in {input.bams}; do
+            sample_name=$(basename "$bam" .bam)
+            printf "%s\tunknown\n" "$sample_name" >> {output.ped}
+        done
+        printf "sample\tstatus\n" > {output.roc}
+        for bam in {input.bams}; do
+            sample_name=$(basename "$bam" .bam)
+            printf "%s\tplaceholder\n" "$sample_name" >> {output.roc}
+        done
         """
 
 rule samtoolsStats:
     input:
-        ANALYSIS_BAM_PATTERN
+        bam=ANALYSIS_BAM_PATTERN,
+        bai=ANALYSIS_BAI_PATTERN
     output:
         stat=final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",
         idxstat=final_path + "/bamcoverage/samtools/{sample}_samtools_idxstats.txt",
@@ -238,16 +283,15 @@ rule samtoolsStats:
         "benchmarks/samtoolsStats/samtoolsStats_{sample}.txt"
     shell:
         """
-        samtools stats {input} > {output.stat}
-        samtools idxstats {input} > {output.idxstat}
-        samtools coverage -H {input} > {output.coverage}
-        samtools coverage  -m --plot-depth -A {input} > {output.coverage_histo}
+        samtools stats {input.bam} > {output.stat}
+        samtools idxstats {input.bam} > {output.idxstat}
+        samtools coverage -H {input.bam} > {output.coverage}
+        samtools coverage  -m --plot-depth -A {input.bam} > {output.coverage_histo}
         """
 
 rule multiqcCoverage:
     input:
         samtools=expand(final_path + "/bamcoverage/samtools/coverage/{sample}_samtools_stats.txt",sample=sample),
-        ped=final_path + "/bamcoverage/goleft/report/report-indexcov.ped",
         stats = expand(final_path + "/coverage/{sample}_bamtools_stats.txt",sample=sample)
     output:
         final_path + "/bamcoverage/multiqc_report.html"
@@ -256,9 +300,9 @@ rule multiqcCoverage:
         mem_mb=200000
     params:
         inpath1 = final_path + "/coverage",
-        inpath2 = final_path + "/bamcoverage",
+        inpath2 = final_path + "/bamcoverage/samtools",
         outputpath = final_path + "/bamcoverage"
     shell:
         """
-        multiqc {params.inpath1} {params.inpath2} --cl-config "log_filesize_limit: 100000000000" -o {params.outputpath}
+        multiqc --force {params.inpath1} {params.inpath2} --cl-config "log_filesize_limit: 100000000000" -o {params.outputpath}
         """

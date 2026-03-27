@@ -7,10 +7,17 @@ import pandas as pd
 configfile: "config_main.yaml"
 
 
-final_path = config["FINALOUTPUT"]+"/"+config["PROJECT"]
-logs_path = config["log_folder"]
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+VARIANT_CALLER = str(config.get("variant_caller", "gatk")).strip().lower()
 
-print("Final output path:", final_path)
+
+def _caller_default_neutral_vcf():
+    if VARIANT_CALLER == "freebayes":
+        return os.path.join(final_path, "freebayes", "final_vcf", "4_fold_degenerate_filtered.ld_pruned.vcf.gz")
+    return os.path.join(final_path, "gatk4", "final_vcf", "4_fold_degenerate_filtered.ld_pruned.vcf.gz")
+
+# Default VCF used for STRUCTURE-related neutral-SNP analyses.
+FINAL_VCF = config.get("final_vcf_neutral") or config.get("final_vcf") or _caller_default_neutral_vcf()
 
 
 rule all:
@@ -32,7 +39,7 @@ MCMC   = config["Structure"]["mcmc"]
         
 rule count_vcf_stats:
     input:
-        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz")
+        vcf=FINAL_VCF
     output:
         inds=final_path + "/structure/num_inds.txt",
         loci=final_path + "/structure/num_loci.txt"
@@ -60,13 +67,13 @@ rule count_vcf_stats:
 
 rule convert_vcf_to_structure:
     input:
-        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz")
+        vcf=FINAL_VCF
     output:
         structure=final_path + "/structure/structure.str"
     conda:
         "../env/structure_env.yaml"
     params:
-        outputpath = final_path + "structure"
+        outputpath = os.path.join(final_path, "structure")
     shell:
         """
         python scripts/VCF_to_STRUCTURE.py -v {input.vcf} \
@@ -258,7 +265,7 @@ rule clumpp:
 
 rule glpca_diploid:
     input:
-        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
+        vcf=FINAL_VCF,
         metadata=config["METAFILE"]
     output:
         pdf=final_path +"/pca/pca_diploid.pdf"
@@ -344,7 +351,7 @@ rule glpca_diploid:
 
 rule glpca_tetraploid:
     input:
-        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
+        vcf=FINAL_VCF,
         metadata=config["METAFILE"]
     output:
         pdf=final_path + "/pca/pca_tetraploid.pdf"
@@ -434,7 +441,7 @@ rule glpca_tetraploid:
 
 rule mixedploidy_pca:
     input:
-        vcf=config.get("final_vcf", final_path + "/gatk4/final_vcf/af_filtered.vcf.gz"),
+        vcf=FINAL_VCF,
         metadata=config["METAFILE"]
     output:
         pdf=final_path + "/pca/pca_mixed.pdf"

@@ -1,0 +1,97 @@
+PROJECT: "synthetic_smoke"
+variant_caller: "gatk"
+QC: no
+TRIMMING: "no"
+SEQTYPE: "ddrad"
+GENOME: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.fa"
+ANNOTATION: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.gff"
+SCAFFOLDS: "ALL"
+METAFILE: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/metadata.tsv"
+INPUT: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq"
+FINALOUTPUT: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/results"
+log_folder: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/logs"
+tmpdir: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/tmp"
+scatter_mode: "chromosome"
+haplotypecaller_scatter_mode: "chromosome"
+jointgenotyping_scatter_mode: "chromosome"
+chromosome_groups: "all"
+haplotypecaller_chromosome_groups: "all"
+jointgenotyping_chromosome_groups: "all"
+intervals_dir: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/intervals"
+scatter_count: 1
+haplotypecaller_scatter_count: 1
+jointgenotyping_scatter_count: 1
+HaplotypeCaller:
+  minConfidenceForVariantCalling: "20"
+  minimum_mapping_quality: 10
+  by_scatter_mode:
+    chromosome:
+      threads: 1
+      mem_mb: 4000
+      time: "1-0"
+      java_xms: "1G"
+      java_xmx: "2G"
+  min_depth: 1
+  qual: 10.0
+  strand_odds_ratio: 10.0
+  quality_by_depth: 0.5
+  fisherstrand: 100.0
+  RMSMappingQuality: 20.0
+  MappingQualityRankSumTest: -20.0
+  ReadPosRankSum: -20.0
+  high_missing: 1.0
+  high_heterozygosity: 1.0
+GenotypeGVCFs:
+  minConfidenceForVariantCalling: "10"
+  by_scatter_mode:
+    chromosome:
+      threads: 1
+      mem_mb: 4000
+      time: "1-0"
+      java_heap_mb: 2000
+      max_alternate_alleles: 12
+      only_output_calls_starting_in_intervals: false
+GenomicsDBImport:
+  by_scatter_mode:
+    chromosome:
+      threads: 1
+      mem_mb: 4000
+      java_xms: "1G"
+      java_xmx: "2G"
+      batch_size: 50
+      interval_padding: 0
+      merge_input_intervals: false
+GATK:
+  min_depth:
+    tetra: 1
+    di: 1
+  max_depth:
+    tetra: 500
+    di: 500
+  INDEL:
+    min_support: 1
+FreeBayes:
+  ploidy: 4
+  chunks: 50000
+  theta: 0.001
+  max_complex_gap: -1
+  use_best_n_alleles: 16
+  min_base_quality: 0
+  min_mapping_quality: 10
+freebayes_params: {}
+VariantFiltering:
+  missingness_max: 1.0
+  freebayes_site_filter:
+    min_qual: 1.0
+    min_saf: 1
+    min_sar: 1
+    min_rpr: 1
+    min_rpl: 1
+  neutral_af_filter:
+    enabled: false
+    min_af: 0.0
+    max_af: 1.0
+  popgen_stats_use_af_filtered: false
+final_vcf_neutral: null
+final_vcf: null
+final_vcf_full: null

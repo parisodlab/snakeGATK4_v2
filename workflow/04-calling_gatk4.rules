@@ -47,6 +47,32 @@ else:
     _ploidy_by_sample = {}
 
 GENOME = config["GENOME"]
+
+
+def genome_dict_path(genome_path: str) -> str:
+    """Return the expected GATK sequence dictionary path for a reference FASTA.
+
+    Avoids using str.rstrip(".fasta"), which strips any trailing characters in that
+    set and can yield incorrect paths (e.g. for .fa, .fna, or other suffixes).
+    """
+
+    base = genome_path
+    for comp_ext in (".gz", ".bgz"):
+        if base.endswith(comp_ext):
+            base = base[: -len(comp_ext)]
+            break
+
+    for fasta_ext in (".fasta", ".fa", ".fna", ".fas"):
+        if base.endswith(fasta_ext):
+            base = base[: -len(fasta_ext)]
+            break
+
+    if base == genome_path:
+        return genome_path + ".dict"
+    return base + ".dict"
+
+
+GENOME_DICT = genome_dict_path(GENOME)
 TMPDIR = str(config.get("tmpdir", "tmp"))
 DEFAULT_SCATTER_MODE = str(config.get("scatter_mode", "interval")).strip().lower()
 DEFAULT_SCATTER_COUNT = int(config.get("scatter_count", 25))
@@ -74,9 +100,9 @@ for scatter_mode_name, scatter_mode_value in {
 
 
 def mode_config(section_name, scatter_mode, defaults):
-    section = config.get(section_name, {})
-    by_mode = section.get("by_scatter_mode", {})
-    mode_values = by_mode.get(scatter_mode, {})
+    section = config.get(section_name) or {}
+    by_mode = section.get("by_scatter_mode") or {}
+    mode_values = by_mode.get(scatter_mode) or {}
     merged = dict(defaults)
     merged.update(mode_values)
     return merged
@@ -280,7 +306,7 @@ rule CreateDict:
     input:
         GENOME
     output:
-        GENOME.rstrip(".fasta") + ".dict"
+        GENOME_DICT
     conda:
         "../env/gatk4_calling_env.yaml"
     shell:
@@ -306,7 +332,7 @@ rule haplotypecaller:
         bam=ANALYSIS_BAM_PATTERN,
         bai=ANALYSIS_BAI_PATTERN,
         reference=GENOME,
-        dict_genome=GENOME.rstrip(".fasta") + ".dict",
+        dict_genome=GENOME_DICT,
         intervals_list=lambda wc: HC_SCATTERED_INTERVAL_LISTS if HC_SCATTER_MODE == "interval" else []
     output:
         vcf=temp(final_path + "/gatk4/gvcf/scattered/{scatter_id}/{sample}.g.vcf.gz"),
@@ -323,6 +349,7 @@ rule haplotypecaller:
         stand_call_conf=config["HaplotypeCaller"]["minConfidenceForVariantCalling"],
         ploidy=get_ploidy,
         region_args=hc_region_args_for_scatter,
+        minimum_mapping_quality=int(config.get("HaplotypeCaller", {}).get("minimum_mapping_quality", 20)),
         java_xms=str(HC_CFG["java_xms"]),
         java_xmx=str(HC_CFG["java_xmx"])
     conda:
@@ -357,6 +384,7 @@ rule haplotypecaller:
             --annotation-group StandardAnnotation \
             --annotation-group AS_StandardAnnotation \
             --annotation-group StandardHCAnnotation \
+            --minimum-mapping-quality {params.minimum_mapping_quality} \
             --pcr-indel-model NONE \
             --all-site-pls
         """
@@ -399,7 +427,7 @@ rule mergeSampleGvcfs:
 rule hc_scatter_intervals_by_ns:
     input:
         reference=GENOME,
-        dict_genome=GENOME.rstrip(".fasta") + ".dict"
+        dict_genome=GENOME_DICT
     output:
         intervals_list=os.path.join(HC_INTERVALS_DIR, "scattered.interval_list")
     conda:
@@ -449,7 +477,7 @@ rule hc_split_intervals:
 rule joint_scatter_intervals_by_ns:
     input:
         reference=GENOME,
-        dict_genome=GENOME.rstrip(".fasta") + ".dict"
+        dict_genome=GENOME_DICT
     output:
         intervals_list=os.path.join(JOINT_INTERVALS_DIR, "scattered.interval_list")
     conda:

@@ -2,8 +2,12 @@
 import os
 configfile: "config_main.yaml"
 
-# Path to four-fold degenerate sites produced by vcf annotation rule (06-vcf_annotation.rules)
-DEGEN_FOUR = os.path.join(config.get('final_output', 'final_output'), 'degeneracy', 'degeneracy-fourfold.bed')
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+PIXY_DIR = os.path.join(final_path, "pixy")
+PUBLICATION_DIR = os.path.join(final_path, "publication")
+
+# Path to four-fold degenerate sites produced by vcf annotation rule (00-vcf_annotation.rules)
+DEGEN_FOUR = os.path.join(final_path, 'degeneracy', 'degeneracy-fourfold.bed')
 
 # Pixy merged site-level stats created by rules in 08-pixy.rules
 PIXY_STATS = ['pi','tajima_d']
@@ -11,7 +15,7 @@ PIXY_STATS = ['pi','tajima_d']
 
 def _ploidies():
 	"""Return list of ploidies. Prefer checkpoint-generated file, otherwise fallback to [2,4]."""
-	pfile = os.path.join('results', 'pixy', 'vcfs_by_ploidy', 'ploidies.txt')
+	pfile = os.path.join(PIXY_DIR, 'vcfs_by_ploidy', 'ploidies.txt')
 	if os.path.exists(pfile):
 		with open(pfile) as fh:
 			pls = [l.strip() for l in fh if l.strip()]
@@ -22,15 +26,15 @@ def _ploidies():
 
 
 def _site_merge_path(ploidy, stat):
-	return f"results/pixy/{ploidy}/pixy_sitelevel_{stat}_merged.tsv.gz"
+	return f"{PIXY_DIR}/{ploidy}/pixy_sitelevel_{stat}_merged.tsv.gz"
 
 
 def _fourfold_out(ploidy, stat):
-	return f"results/publication/{ploidy}/pixy_sitelevel_{stat}_4fold.tsv.gz"
+	return f"{PUBLICATION_DIR}/{ploidy}/pixy_sitelevel_{stat}_4fold.tsv.gz"
 
 
 def _per_sample_out(ploidy):
-	return f"results/publication/{ploidy}/pixy_4fold_per_sample_summary.tsv"
+	return f"{PUBLICATION_DIR}/{ploidy}/pixy_4fold_per_sample_summary.tsv"
 
 
 rule all:
@@ -42,7 +46,7 @@ rule all:
 			for s in PIXY_STATS
 		],
 		# per-ploidy population summaries
-		lambda wildcards: [f"results/publication/{p}/pixy_4fold_summary.tsv" for p in _ploidies()],
+		lambda wildcards: [f"{PUBLICATION_DIR}/{p}/pixy_4fold_summary.tsv" for p in _ploidies()],
 		# per-ploidy per-sample summaries
 		lambda wildcards: [_per_sample_out(p) for p in _ploidies()],
 		DEGEN_FOUR
@@ -58,7 +62,7 @@ rule filter_pixy_to_4fold:
 		merged=lambda wildcards: _site_merge_path(wildcards.ploidy, wildcards.stat),
 		deg4=DEGEN_FOUR
 	output:
-		out=lambda wildcards: _fourfold_out(wildcards.ploidy, wildcards.stat)
+		out=f"{PUBLICATION_DIR}/{{ploidy}}/pixy_sitelevel_{{stat}}_4fold.tsv.gz"
 	params:
 		ploidy=lambda wildcards: wildcards.ploidy,
 		stat=lambda wildcards: wildcards.stat
@@ -69,7 +73,7 @@ rule filter_pixy_to_4fold:
 
 		merged = input.merged
 		deg4 = input.deg4
-		outpath = output[0]
+		outpath = output.out
 		os.makedirs(os.path.dirname(outpath), exist_ok=True)
 
 		# read degenerate fourfold bed into per-chromosome interval lists
@@ -171,9 +175,9 @@ rule summarize_pixy_4fold_by_pop:
 	input:
 		pi=lambda wildcards: _fourfold_out(wildcards.ploidy, 'pi'),
 		taj=lambda wildcards: _fourfold_out(wildcards.ploidy, 'tajima_d'),
-		pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt"
+		pops=lambda wildcards: f"{PIXY_DIR}/populations_by_ploidy/populations_{wildcards.ploidy}.txt"
 	output:
-		f="results/publication/{{ploidy}}/pixy_4fold_summary.tsv"
+		f=f"{PUBLICATION_DIR}/{{ploidy}}/pixy_4fold_summary.tsv"
 	params:
 		stat_pi='pi', stat_taj='tajima_d'
 	run:
@@ -300,9 +304,9 @@ rule summarize_pixy_4fold_by_sample:
 	input:
 		pi=lambda wildcards: _fourfold_out(wildcards.ploidy, 'pi'),
 		taj=lambda wildcards: _fourfold_out(wildcards.ploidy, 'tajima_d'),
-		pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt"
+		pops=lambda wildcards: f"{PIXY_DIR}/populations_by_ploidy/populations_{wildcards.ploidy}.txt"
 	output:
-		f="results/publication/{ploidy}/pixy_4fold_per_sample_summary.tsv"
+		f=f"{PUBLICATION_DIR}/{{ploidy}}/pixy_4fold_per_sample_summary.tsv"
 	run:
 		import pandas as pd
 		import os

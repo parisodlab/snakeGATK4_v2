@@ -11,6 +11,9 @@ PROJECT: "Biscutella_remapping_varia"
 
 # ================== Control of the workflow ==================
 
+## Default variant caller used by main_pipeline.py when --caller is not provided.
+variant_caller: "gatk" # "gatk" or "freebayes"
+
 ## Whether to run the QC stage when that stage is wired into the launcher.
 QC: no # "yes" or "no"
 
@@ -174,8 +177,11 @@ GATK:
 
 
 # FreeBayes is optional and separate from the main GATK calling path.
-# Leave these unchanged unless you actively run the FreeBayes workflow.
+# For mixed-ploidy datasets, sample-specific ploidy is taken from METAFILE and
+# passed through a generated FreeBayes cnv-map. FreeBayes.ploidy acts as the
+# default/fallback ploidy when a sample has no metadata ploidy.
 FreeBayes:
+  ploidy: 4 # default/fallback ploidy for samples missing metadata ploidy
   chunks: 50000
   theta: 0.001 # mutation rate / expected pairwise nucleotide diversity (freebayes default 0.001)
   max_complex_gap: -1 #  Allow haplotype calls with contiguous embedded matches of up to this length. Set N=-1 to disable clumping. (freebayes default: 3).  Read length/2 should be safe
@@ -183,9 +189,31 @@ FreeBayes:
   min_base_quality: 20 # minimum base quality for variant calling
   min_mapping_quality: 20 # minimum mapping quality for variant calling
 
-# Convenience pointers for downstream tools and analyses.
-final_vcf: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz"
-final_vcf_full: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/gatk4/final_vcf/missingness_filtered.vcf.gz"
+# Optional extra FreeBayes CLI arguments in the style used by the standalone germline pipeline.
+# Example:
+# freebayes_params:
+#   --standard-filters: true
+#   --min-alternate-count: 2
+freebayes_params: {}
+
+# Shared post-calling filter settings.
+# Neutral-SNP tools (Structure, NJ tree, etc.) use the fourfold + LD-pruned branch.
+# Broad popgen-stat tools (pixy, piawka) stay on the broader filtered VCF by default.
+VariantFiltering:
+  missingness_max: 0.5
+  neutral_af_filter:
+    enabled: true
+    min_af: 0.025
+    max_af: 0.975
+  popgen_stats_use_af_filtered: false
+
+# Convenience override pointers for downstream tools and analyses.
+# final_vcf_neutral is for neutral-SNP analyses such as Structure and NJ trees.
+# final_vcf_full is for broad downstream statistics such as pixy and piawka.
+# final_vcf remains as a generic legacy override used when a stage has no more specific key.
+final_vcf_neutral: null
+final_vcf: null
+final_vcf_full: null
 
 
 # ------------------ Downstream population analyses ------------------
@@ -210,7 +238,7 @@ popgen_investigate:
   # ───── Dsuite parameters ─────
   tree: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/phylogeny/all_individuals_Neis_distance.nwk"
   outgroups: ["V2", "K2"] # list of outgroup samples for Dsuite (can be multiple) 
-  vcf: "/data/users/rchoudhury/snakeSNPcalling/results/Biscutella_remapping_varia/gatk4/final_vcf/4_fold_degenerate_filtered.ld_pruned.vcf.gz"
+  vcf: null # optional override; leave null to follow variant_caller
   treemix_metadata: "/data/users/rchoudhury/snakeSNPcalling/configs/treemix_metadata.tsv"
   treemix_migration_events: [0, 1, 2, 3, 4, 5] # migration events to test
   treemix_bootstraps: 100 # number of bootstrap replicates for Treemix

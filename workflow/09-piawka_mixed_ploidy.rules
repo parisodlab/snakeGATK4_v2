@@ -8,12 +8,36 @@ Clean BED-based piawka rules:
 import os
 configfile: "config_main.yaml"
 
-VCF = config.get("final_vcf_full")
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+PIAWKA_DIR = os.path.join(final_path, "piawka")
+VARIANT_CALLER = str(config.get("variant_caller", "gatk")).strip().lower()
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+FILTERING_CFG = config.get("VariantFiltering", {})
+POPGEN_USE_AF_FILTER = _as_bool(FILTERING_CFG.get("popgen_stats_use_af_filtered", False), False)
+
+
+def _caller_default_vcf():
+    filename = "af_filtered.vcf.gz" if POPGEN_USE_AF_FILTER else "filtered.vcf.gz"
+    if VARIANT_CALLER == "freebayes":
+        return os.path.join(final_path, "freebayes", "final_vcf", filename)
+    return os.path.join(final_path, "gatk4", "final_vcf", filename)
+
+DEFAULT_VCF = _caller_default_vcf()
+VCF = config.get("final_vcf_full") or config.get("final_vcf") or DEFAULT_VCF
 METAFILE = config.get("METAFILE", config.get("metafile", None))
 PIAWKA_CORES = int(config.get("piawka_cores", 2))
 PIAWKA_MISS_GENERAL = float(config.get("piawka_miss_general", 0.5))
 PIAWKA_MISS_TAJIMA = float(config.get("piawka_miss_tajima", 0.0))
-PIAWKA_BED = config.get("piawka_bed", "results/piawka/intervals.bed")
+PIAWKA_BED = config.get("piawka_bed", os.path.join(PIAWKA_DIR, "intervals.bed"))
 
 # default window size (can be overridden in config under GenomeScan.window)
 window_default = config.get("GenomeScan", {}).get("window", 10000)
@@ -22,7 +46,7 @@ window_default = config.get("GenomeScan", {}).get("window", 10000)
 
 
 if VCF is None:
-    raise ValueError("config['final_vcf_full'] must be set")
+    raise ValueError("final VCF path must be set (config['final_vcf_full'] or config['final_vcf'])")
 
 
 def _ploidies():
@@ -37,16 +61,16 @@ def _ploidies():
 
 def _targets():
     t = [PIAWKA_BED,
-         "results/piawka/groups_mixed.txt",
-         "results/piawka/groups_diploid_vs_tetraploid.txt",
-         "results/piawka/mixed/window/piawka_main.tsv.gz",
-         "results/piawka/mixed/window/piawka_tajima.tsv.gz",
-         "results/piawka/mixed/persite/piawka_main_persite.tsv.gz",
-         "results/piawka/mixed/persite/piawka_tajima_persite.tsv.gz",
-        "results/piawka/ploidy/window/piawka_main.tsv.gz",
-        "results/piawka/ploidy/window/piawka_tajima.tsv.gz",
-        "results/piawka/ploidy/persite/piawka_main_persite.tsv.gz",
-        "results/piawka/ploidy/persite/piawka_tajima_persite.tsv.gz"]
+         os.path.join(PIAWKA_DIR, "groups_mixed.txt"),
+         os.path.join(PIAWKA_DIR, "groups_diploid_vs_tetraploid.txt"),
+         os.path.join(PIAWKA_DIR, "mixed", "window", "piawka_main.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "mixed", "window", "piawka_tajima.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "mixed", "persite", "piawka_main_persite.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "mixed", "persite", "piawka_tajima_persite.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "ploidy", "window", "piawka_main.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "ploidy", "window", "piawka_tajima.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "ploidy", "persite", "piawka_main_persite.tsv.gz"),
+         os.path.join(PIAWKA_DIR, "ploidy", "persite", "piawka_tajima_persite.tsv.gz")]
     return t
 
 
@@ -100,16 +124,21 @@ rule generate_piawka_groups_mixed:
     input:
         metafile=METAFILE
     output:
-        groups="results/piawka/groups_mixed.txt"
+        groups=os.path.join(PIAWKA_DIR, "groups_mixed.txt")
     run:
         import pandas as pd
         if not input.metafile:
             raise ValueError('METAFILE required')
         df = pd.read_csv(input.metafile, sep='\t', dtype=str)
-        if 'sample' not in df.columns or 'pop' not in df.columns:
-            raise ValueError('METAFILE requires sample and pop columns')
+        if 'sample' not in df.columns:
+            raise ValueError('METAFILE requires sample column')
+        pop_col = 'pop' if 'pop' in df.columns else ('population' if 'population' in df.columns else None)
+        if pop_col is None:
+            raise ValueError('METAFILE requires pop or population column')
         os.makedirs(os.path.dirname(output.groups) or '.', exist_ok=True)
-        df[['sample','pop']].drop_duplicates().to_csv(output.groups, sep='\t', header=False, index=False)
+        out = df[['sample', pop_col]].drop_duplicates()
+        out.columns = ['sample', 'pop']
+        out.to_csv(output.groups, sep='\t', header=False, index=False)
 
 
 
@@ -119,7 +148,7 @@ rule generate_piawka_groups_diploid_vs_tetraploid:
     input:
         metafile=METAFILE
     output:
-        groups="results/piawka/groups_diploid_vs_tetraploid.txt"
+        groups=os.path.join(PIAWKA_DIR, "groups_diploid_vs_tetraploid.txt")
     run:
         import pandas as pd, os
         if not input.metafile:
@@ -139,10 +168,10 @@ rule generate_piawka_groups_diploid_vs_tetraploid:
 rule piawka_mixed_main:
     input:
         vcf=VCF,
-        groups="results/piawka/groups_mixed.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_mixed.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/mixed/window/piawka_main.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "mixed", "window", "piawka_main.tsv.gz")
     threads:
         50
     resources:
@@ -160,10 +189,10 @@ rule piawka_mixed_main:
 rule piawka_mixed_tajima:
     input:
         vcf=VCF,
-        groups="results/piawka/groups_mixed.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_mixed.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/mixed/window/piawka_tajima.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "mixed", "window", "piawka_tajima.tsv.gz")
     threads:
         50
     resources:
@@ -182,10 +211,10 @@ rule piawka_mixed_persite:
     """Run piawka per-site values (persite) for mixed-ploidy main stats."""
     input:
         vcf=VCF,
-        groups="results/piawka/groups_mixed.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_mixed.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/mixed/persite/piawka_main_persite.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "mixed", "persite", "piawka_main_persite.tsv.gz")
     threads:
         50
     resources:
@@ -204,10 +233,10 @@ rule piawka_mixed_persite_tajima:
     """Run piawka per-site Tajima D (persite) with strict no-missing."""
     input:
         vcf=VCF,
-        groups="results/piawka/groups_mixed.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_mixed.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/mixed/persite/piawka_tajima_persite.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "mixed", "persite", "piawka_tajima_persite.tsv.gz")
     threads:
         50
     resources:
@@ -225,10 +254,10 @@ rule piawka_mixed_persite_tajima:
 rule piawka_ploidy_main:
     input:
         vcf=VCF,
-        groups="results/piawka/groups_diploid_vs_tetraploid.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_diploid_vs_tetraploid.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/ploidy/window/piawka_main.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "ploidy", "window", "piawka_main.tsv.gz")
     threads:
         50
     resources:
@@ -246,10 +275,10 @@ rule piawka_ploidy_main:
 rule piawka_ploidy_tajima:
     input:
         vcf=VCF,
-        groups="results/piawka/groups_diploid_vs_tetraploid.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_diploid_vs_tetraploid.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/ploidy/window/piawka_tajima.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "ploidy", "window", "piawka_tajima.tsv.gz")
     threads:
         50
     resources:
@@ -268,10 +297,10 @@ rule piawka_ploidy_persite:
     """Per-ploidy per-site persite main stats."""
     input:
         vcf=VCF,
-        groups="results/piawka/groups_diploid_vs_tetraploid.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_diploid_vs_tetraploid.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/ploidy/persite/piawka_main_persite.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "ploidy", "persite", "piawka_main_persite.tsv.gz")
     threads:
         50
     resources:
@@ -290,10 +319,10 @@ rule piawka_ploidy_persite_tajima:
     """Per-ploidy per-site Tajima D (persite) strict no-missing."""
     input:
         vcf=VCF,
-        groups="results/piawka/groups_diploid_vs_tetraploid.txt",
+        groups=os.path.join(PIAWKA_DIR, "groups_diploid_vs_tetraploid.txt"),
         bed=PIAWKA_BED
     output:
-        tsv="results/piawka/ploidy/persite/piawka_tajima_persite.tsv.gz"
+        tsv=os.path.join(PIAWKA_DIR, "ploidy", "persite", "piawka_tajima_persite.tsv.gz")
     threads:
         50
     resources:

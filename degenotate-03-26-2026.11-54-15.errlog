@@ -1,0 +1,7 @@
+
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+**Error OP10: Output directory already exists: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/results/synthetic_smoke/degeneracy/. Specify new directory name OR set --overwrite to overwrite all files in that directory.
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+Script call: /data/users/rchoudhury/snakeSNPcalling/.snakemake/conda/4fd997473ad03680102e54bcbf098cfe_/bin/degenotate.py -a /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.gff -g /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.fa -o /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/results/synthetic_smoke/degeneracy/

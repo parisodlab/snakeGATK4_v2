@@ -1,0 +1,75 @@
+import pandas as pd
+import os
+configfile: "config_main.yaml"
+
+GENOME = config["GENOME"]
+GENOME_GFF= config["ANNOTATION"]
+final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
+
+rule all:
+	input:
+		final_path + "/degeneracy/degeneracy-fourfold.bed",
+		final_path + "/degeneracy/degeneracy-zerofold.bed"
+
+rule degeneracy_annotation:
+	input:
+		reference=GENOME,
+		gff=GENOME_GFF,
+	output:
+		final_path + "/degeneracy/degeneracy-all-sites.bed"
+	benchmark:
+		"benchmarks/vcf_annotation/degeneracy.txt"
+	threads:
+		4
+	params:
+		outputpath=final_path + "/degeneracy/"
+	resources:
+		mem_mb = 8000,
+		time = "3-0"
+	conda: "../env/vcf_annotation.yaml"
+	shell:
+		"""
+		degenotate.py -a {input.gff} -g {input.reference} -o {params.outputpath} --overwrite
+		"""
+
+rule degenerate_site_fourfold:
+	input:
+		bed=final_path + "/degeneracy/degeneracy-all-sites.bed"
+	output:
+		final_path + "/degeneracy/degeneracy-fourfold.bed"
+	benchmark:
+		"benchmarks/vcf_annotation/degeneracy_fourfold.bed"
+	threads:
+		4
+	params:
+		outputpath=final_path + "/degeneracy/"
+	resources:
+		mem_mb = 8000,
+		time = "3-0"
+	run:
+		with open(input[0]) as f, open(output[0], "w") as out:
+			for line in f:
+				cols = line.strip().split("\t")
+				if len(cols) >= 5 and cols[4] == '4':
+					out.write(line)
+
+rule degenerate_site_zerofold:
+	input:
+		bed=final_path + "/degeneracy/degeneracy-all-sites.bed"
+	output:
+		final_path + "/degeneracy/degeneracy-zerofold.bed"
+	benchmark:
+		"benchmarks/vcf_annotation/degeneracy_zerofold.bed"
+	threads:
+		4
+	params:
+		outputpath=final_path + "/degeneracy/"
+	resources:
+		mem_mb = 8000,
+		time = "3-0"
+	run:
+		with open(input[0]) as f, open(output[0], "w") as out:
+			for line in f:
+				cols = line.strip().split("\t")
+				if len(cols) >= 5 and cols[4] == '0':
+					out.write(line)

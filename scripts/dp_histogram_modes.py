@@ -11,14 +11,34 @@ input_file = snakemake.input[0]
 output_geno_pdf = snakemake.output[0]
 output_sites_pdf = snakemake.output[1]
 
+
+def write_placeholder_pdf(path, title, reason):
+    with PdfPages(path) as pdf:
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.axis('off')
+        ax.text(0.5, 0.60, title, ha='center', va='center', fontsize=16)
+        ax.text(0.5, 0.42, reason, ha='center', va='center', fontsize=11)
+        pdf.savefig(fig)
+        plt.close(fig)
+
 # Load CSV (tab-separated)
 df = pd.read_csv(input_file, sep='\t')
 
 # Filter bins
 df = df[(df['Bin'] >= 4) & (df['Bin'] <= 200)]
 
+if df.empty:
+    write_placeholder_pdf(output_geno_pdf, "NumGeno Distribution", "No depth bins between 4 and 200 were available.")
+    write_placeholder_pdf(output_sites_pdf, "NumSites Distribution", "No depth bins between 4 and 200 were available.")
+    raise SystemExit(0)
+
 # Unique samples
 samples = df['Sample'].unique()
+
+if len(samples) == 0:
+    write_placeholder_pdf(output_geno_pdf, "NumGeno Distribution", "No samples remained after filtering the DP table.")
+    write_placeholder_pdf(output_sites_pdf, "NumSites Distribution", "No samples remained after filtering the DP table.")
+    raise SystemExit(0)
 
 # Plot NumGeno vs Bin
 with PdfPages(output_geno_pdf) as pdf:

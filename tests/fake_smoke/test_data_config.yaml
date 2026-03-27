@@ -1,0 +1,13 @@
+reference_fasta: /data/users/rchoudhury/Biscutella_Genomes/Biscutella_centromeres_and_chromosome_evolution/Genome_assemblies/Varia_review2.FINAL.Syri.fa
+annotation_gff: /data/users/rchoudhury/Biscutella_Genomes/Biscutella_centromeres_and_chromosome_evolution/Genome_annotations/Genes/Varia.all.maker.renamed.gff
+contig: Bv3
+region_start: 1
+region_length: 10000000
+region_name: Bv3_1_10000000
+coverage_levels:
+  - 20
+  - 5
+mutation_rate: 0.003
+read_length: 150
+iss_model: novaseq
+iss_cpus: 1

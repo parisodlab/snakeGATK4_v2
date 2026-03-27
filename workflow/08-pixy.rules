@@ -2,10 +2,38 @@ import os
 import subprocess
 configfile: "config_main.yaml"
 
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+PIXY_DIR = os.path.join(final_path, "pixy")
+VARIANT_CALLER = str(config.get("variant_caller", "gatk")).strip().lower()
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+FILTERING_CFG = config.get("VariantFiltering", {})
+POPGEN_USE_AF_FILTER = _as_bool(FILTERING_CFG.get("popgen_stats_use_af_filtered", False), False)
+
+
+def _caller_default_vcf():
+    filename = "af_filtered.vcf.gz" if POPGEN_USE_AF_FILTER else "filtered.vcf.gz"
+    if VARIANT_CALLER == "freebayes":
+        return os.path.join(final_path, "freebayes", "final_vcf", filename)
+    return os.path.join(final_path, "gatk4", "final_vcf", filename)
+
 # Configurable values with sane defaults
-VCF = config.get("final_vcf_full")
+DEFAULT_VCF = _caller_default_vcf()
+VCF = config.get("final_vcf_full") or config.get("final_vcf") or DEFAULT_VCF
+
 # Path for populations file used by pixy; if not provided, we will generate it from METAFILE
-POPS = config.get("pixy_populations", config.get("populations_file", "configs/pixy_populations.txt"))
+POPS = config.get(
+    "pixy_populations",
+    config.get("populations_file", os.path.join(PIXY_DIR, "metadata", "populations.txt"))
+)
 METAFILE = config.get("METAFILE", config.get("metafile", None))
 PIXY_WINDOW = config.get("pixy_window", config.get("window", 10000))
 PIXY_STEP = config.get("pixy_step", PIXY_WINDOW)
@@ -13,9 +41,9 @@ STATS = config.get("pixy_stats", ["pi","dxy","fst","watterson_theta","tajima_d"]
 N_CORES = config.get("pixy_cores", 2)
 
 if VCF is None:
-    raise ValueError("config['final_vcf_full'] must be set to the path of the final VCF.gz")
+    raise ValueError("final VCF path must be set (config['final_vcf_full'] or config['final_vcf'])")
 
-# note: we'll run pixy per-ploidy and place results under results/pixy/{ploidy}/...
+# note: we'll run pixy per-ploidy and place results under {final_path}/pixy/{ploidy}/...
 
 
 
@@ -27,9 +55,9 @@ def _all_merged_targets():
     for p in ploidies:
         for stat in STATS:
             # Prefer aggregated (gzipped) windowed statistics as final targets
-            targets.append(f"results/pixy/{p}/pixy_windowed_{stat}_aggregated.tsv.gz")
+            targets.append(f"{PIXY_DIR}/{p}/pixy_windowed_{stat}_aggregated.tsv.gz")
             # Also include merged site-level stats (gzipped) for completeness
-            targets.append(f"results/pixy/{p}/pixy_sitelevel_{stat}_merged.tsv.gz")
+            targets.append(f"{PIXY_DIR}/{p}/pixy_sitelevel_{stat}_merged.tsv.gz")
     return targets
 
 
@@ -38,7 +66,7 @@ rule all:
     """
     input:
         POPS,
-        "results/pixy/chroms_generated.done",
+        f"{PIXY_DIR}/chroms_generated.done",
         lambda wildcards: _all_merged_targets()
 
 
@@ -81,7 +109,7 @@ def _chroms(ploidy=None):
         return _chrom_cache[cache_key]
     
     # First, try reading a precomputed chrom list written by the checkpoint
-    chroms_dir = os.path.join('results', 'pixy', 'vcfs_by_ploidy')
+    chroms_dir = os.path.join(PIXY_DIR, 'vcfs_by_ploidy')
     if ploidy is not None:
         chroms_file = os.path.join(chroms_dir, f"chroms_{ploidy}.txt")
         if os.path.exists(chroms_file):
@@ -124,7 +152,7 @@ checkpoint split_by_ploidy:
         vcf=VCF,
         metafile=METAFILE
     output:
-        directory("results/pixy/vcfs_by_ploidy")
+        directory(os.path.join(PIXY_DIR, "vcfs_by_ploidy"))
     threads:
         50
     run:
@@ -176,7 +204,7 @@ rule create_ploidy_vcf:
     input:
         ck_dir=lambda wildcards: checkpoints.split_by_ploidy.get().output[0]
     output:
-        touch("results/pixy/vcfs_by_ploidy_created.done")
+        touch(os.path.join(PIXY_DIR, "vcfs_by_ploidy_created.done"))
     threads:
         50
     run:
@@ -223,9 +251,9 @@ rule generate_pixy_chroms:
     """
     input:
         ck_dir=lambda wildcards: checkpoints.split_by_ploidy.get().output[0],
-        vcfs_created="results/pixy/vcfs_by_ploidy_created.done"
+        vcfs_created=os.path.join(PIXY_DIR, "vcfs_by_ploidy_created.done")
     output:
-        touch("results/pixy/chroms_generated.done")
+        touch(os.path.join(PIXY_DIR, "chroms_generated.done"))
     run:
         import glob, os, subprocess
         vdir = checkpoints.split_by_ploidy.get().output[0]
@@ -271,7 +299,7 @@ rule generate_pixy_chroms:
                     continue
 
         # write global chroms file
-        global_file = os.path.join('results', 'pixy', 'chroms_global.txt')
+        global_file = os.path.join(PIXY_DIR, 'chroms_global.txt')
         os.makedirs(os.path.dirname(global_file), exist_ok=True)
         with open(global_file, 'w') as gh:
             for c in all_chroms:
@@ -297,7 +325,7 @@ def _pixy_window_targets(wc):
             ppath = os.path.join(vdir, f"ploidy_{p}.vcf.gz")
             raise ValueError(f"No contigs found for ploidy {p}. Check per-ploidy VCF: {ppath} or global VCF: {VCF}")
         for c in chroms:
-            targets.append(f"results/pixy/{p}/windowed/{c}/pixy_windowed_pi.txt")
+            targets.append(f"{PIXY_DIR}/{p}/windowed/{c}/pixy_windowed_pi.txt")
         return targets
 
     # no specific ploidy provided; return all ploidies
@@ -310,7 +338,7 @@ def _pixy_window_targets(wc):
             ppath = os.path.join(vdir, f"ploidy_{p}.vcf.gz")
             raise ValueError(f"No contigs found for ploidy {p}. Check per-ploidy VCF: {ppath} or global VCF: {VCF}")
         for c in chroms:
-            targets.append(f"results/pixy/{p}/windowed/{c}/pixy_windowed_pi.txt")
+            targets.append(f"{PIXY_DIR}/{p}/windowed/{c}/pixy_windowed_pi.txt")
     return targets
 
 
@@ -325,14 +353,14 @@ def _pixy_site_targets(wc):
     if p:
         chroms = _chroms(ploidy=p)
         for c in chroms:
-            targets.append(f"results/pixy/{p}/sitelevel/{c}/pixy_site_pi.txt")
+            targets.append(f"{PIXY_DIR}/{p}/sitelevel/{c}/pixy_site_pi.txt")
         return targets
 
     ploidies = _ploidies()
     for p in ploidies:
         chroms = _chroms(ploidy=p)
         for c in chroms:
-            targets.append(f"results/pixy/{p}/sitelevel/{c}/pixy_site_pi.txt")
+            targets.append(f"{PIXY_DIR}/{p}/sitelevel/{c}/pixy_site_pi.txt")
     return targets
 
 
@@ -347,13 +375,13 @@ def _pixy_window_done_targets(wc):
     if p:
         chroms = _chroms(ploidy=p)
         for c in chroms:
-            targets.append(f"results/pixy/{p}/windowed/{c}/.done")
+            targets.append(f"{PIXY_DIR}/{p}/windowed/{c}/.done")
         return targets
     ploidies = _ploidies()
     for p in ploidies:
         chroms = _chroms(ploidy=p)
         for c in chroms:
-            targets.append(f"results/pixy/{p}/windowed/{c}/.done")
+            targets.append(f"{PIXY_DIR}/{p}/windowed/{c}/.done")
     return targets
 
 
@@ -364,13 +392,13 @@ def _pixy_site_done_targets(wc):
     if p:
         chroms = _chroms(ploidy=p)
         for c in chroms:
-            targets.append(f"results/pixy/{p}/sitelevel/{c}/.done")
+            targets.append(f"{PIXY_DIR}/{p}/sitelevel/{c}/.done")
         return targets
     ploidies = _ploidies()
     for p in ploidies:
         chroms = _chroms(ploidy=p)
         for c in chroms:
-            targets.append(f"results/pixy/{p}/sitelevel/{c}/.done")
+            targets.append(f"{PIXY_DIR}/{p}/sitelevel/{c}/.done")
     return targets
 
 
@@ -411,7 +439,7 @@ rule generate_ploidy_populations:
         metafile=METAFILE,
         any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     output:
-        popfile="results/pixy/populations_by_ploidy/populations_{ploidy}.txt"
+        popfile=f"{PIXY_DIR}/populations_by_ploidy/populations_{{ploidy}}.txt"
     run:
         import pandas as pd
         import os
@@ -429,19 +457,19 @@ rule generate_ploidy_populations:
 
 rule pixy_windowed:
     input:
-        populations=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
+        populations=lambda wildcards: f"{PIXY_DIR}/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
         any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     output:
-        touch("results/pixy/{ploidy}/windowed/{chrom}/.done")
+        touch(f"{PIXY_DIR}/{{ploidy}}/windowed/{{chrom}}/.done")
     threads:
         10
     resources:
         mem_mb=10000
     params:
-        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/windowed/{wildcards.chrom}",
+        outdir=lambda wildcards: f"{PIXY_DIR}/{wildcards.ploidy}/windowed/{wildcards.chrom}",
         window_size=PIXY_WINDOW,
         stats=" ".join(STATS),
-        pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
+        pops=lambda wildcards: f"{PIXY_DIR}/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
         vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     conda:
         "../env/pixy.yaml"
@@ -473,10 +501,10 @@ rule pixy_windowed:
 
 rule pixy_sitelevel:
     input:
-        populations=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
+        populations=lambda wildcards: f"{PIXY_DIR}/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
         any_vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz")
     output:
-        touch("results/pixy/{ploidy}/sitelevel/{chrom}/.done")
+        touch(f"{PIXY_DIR}/{{ploidy}}/sitelevel/{{chrom}}/.done")
     threads:
         20
     resources:
@@ -485,9 +513,9 @@ rule pixy_sitelevel:
     conda:
         "../env/pixy.yaml"
     params:
-        outdir=lambda wildcards: f"results/pixy/{wildcards.ploidy}/sitelevel/{wildcards.chrom}",
+        outdir=lambda wildcards: f"{PIXY_DIR}/{wildcards.ploidy}/sitelevel/{wildcards.chrom}",
         stats=" ".join(STATS),
-        pops=lambda wildcards: f"results/pixy/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
+        pops=lambda wildcards: f"{PIXY_DIR}/populations_by_ploidy/populations_{wildcards.ploidy}.txt",
         vcf=lambda wildcards: os.path.join(checkpoints.split_by_ploidy.get().output[0], f"ploidy_{wildcards.ploidy}.vcf.gz"),
         out_prefix="pixy_site"
     shell:
@@ -525,7 +553,7 @@ rule merge_pixy_windowed_by_stat:
     input:
         lambda wildcards: _pixy_window_done_targets(wildcards)
     output:
-        "results/pixy/{ploidy}/pixy_windowed_{stat}_merged.tsv.gz"
+        f"{PIXY_DIR}/{{ploidy}}/pixy_windowed_{{stat}}_merged.tsv.gz"
     params:
         stat=lambda wildcards: wildcards.stat
     run:
@@ -536,7 +564,7 @@ rule merge_pixy_windowed_by_stat:
         os.makedirs(outdir, exist_ok=True)
         stat = params.stat
         all_dfs = []
-        patterns = [f"results/pixy/{wildcards.ploidy}/windowed/*/pixy_windowed_{stat}.txt.gz", f"results/pixy/{wildcards.ploidy}/windowed/*/pixy_windowed_{stat}.txt"]
+        patterns = [f"{PIXY_DIR}/{wildcards.ploidy}/windowed/*/pixy_windowed_{stat}.txt.gz", f"{PIXY_DIR}/{wildcards.ploidy}/windowed/*/pixy_windowed_{stat}.txt"]
         for pat in patterns:
             for fp in glob.glob(pat):
                 if fp.endswith('.gz'):
@@ -562,9 +590,9 @@ rule aggregate_pixy_windowed_by_stat:
     """
     input:
         # accept gzipped merged input
-        merged=lambda wildcards: f"results/pixy/{wildcards.ploidy}/pixy_windowed_{wildcards.stat}_merged.tsv.gz"
+        merged=lambda wildcards: f"{PIXY_DIR}/{wildcards.ploidy}/pixy_windowed_{wildcards.stat}_merged.tsv.gz"
     output:
-        agg="results/pixy/{ploidy}/pixy_windowed_{stat}_aggregated.tsv.gz"
+        agg=f"{PIXY_DIR}/{{ploidy}}/pixy_windowed_{{stat}}_aggregated.tsv.gz"
     params:
         stat=lambda wildcards: wildcards.stat
     run:
@@ -622,12 +650,12 @@ rule aggregate_pixy_windowed_by_stat:
 rule merge_pixy_sitelevel_by_stat:
     """Merge all per-site pixy outputs for a single statistic into one TSV.
 
-    Produces files like results/pixy/pixy_sitelevel_pi_merged.tsv
+    Produces files like {final_path}/pixy/{ploidy}/pixy_sitelevel_pi_merged.tsv
     """
     input:
         lambda wildcards: _pixy_site_done_targets(wildcards)
     output:
-        "results/pixy/{ploidy}/pixy_sitelevel_{stat}_merged.tsv.gz"
+        f"{PIXY_DIR}/{{ploidy}}/pixy_sitelevel_{{stat}}_merged.tsv.gz"
     params:
         stat=lambda wildcards: wildcards.stat
     run:
@@ -638,7 +666,7 @@ rule merge_pixy_sitelevel_by_stat:
         os.makedirs(outdir, exist_ok=True)
         stat = params.stat
         all_dfs = []
-        patterns = [f"results/pixy/{wildcards.ploidy}/sitelevel/*/pixy_site_{stat}.txt.gz", f"results/pixy/{wildcards.ploidy}/sitelevel/*/pixy_site_{stat}.txt"]
+        patterns = [f"{PIXY_DIR}/{wildcards.ploidy}/sitelevel/*/pixy_site_{stat}.txt.gz", f"{PIXY_DIR}/{wildcards.ploidy}/sitelevel/*/pixy_site_{stat}.txt"]
         for pat in patterns:
             for fp in glob.glob(pat):
                 if fp.endswith('.gz'):

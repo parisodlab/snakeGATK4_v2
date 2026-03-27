@@ -1,0 +1,275 @@
+import os
+
+import pandas as pd
+
+configfile: "config_main.yaml"
+
+METAFILE = config["METAFILE"]
+GENOME = config["GENOME"]
+final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+
+samples = pd.read_csv(METAFILE, sep='\t', dtype=str)
+if "sample" not in samples.columns:
+    raise ValueError("Metadata file must contain a 'sample' column")
+samples["sample"] = samples["sample"].astype(str)
+samples = samples.dropna(subset=["sample"]).drop_duplicates(subset=["sample"]).reset_index(drop=True)
+
+POP_COL = "pop" if "pop" in samples.columns else ("population" if "population" in samples.columns else None)
+if POP_COL is None:
+    raise ValueError("Metadata file must contain a 'pop' or 'population' column")
+
+PLOIDY_COL = "ploidy" if "ploidy" in samples.columns else None
+if PLOIDY_COL is None:
+    raise ValueError("Metadata file must contain a 'ploidy' column")
+
+META_DIR = os.path.join(final_path, "metadata")
+SAMPLE_POP_UNIQUE = os.path.join(META_DIR, "sample_pop_unique.tsv")
+SAMPLE_PLOIDY_UNIQUE = os.path.join(META_DIR, "sample_ploidy_unique.tsv")
+SAMPLE_PLOIDY_COLCHITETRA = os.path.join(META_DIR, "sample_ploidy_unique_colchitetra.tsv")
+
+FREEBAYES_VCF_DIR = os.path.join(final_path, "freebayes", "final_vcf")
+FILTERED_VCF = os.path.join(FREEBAYES_VCF_DIR, "filtered.vcf.gz")
+
+
+def _as_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+FILTERING_CFG = config.get("VariantFiltering", {})
+MISSINGNESS_MAX = float(FILTERING_CFG.get("missingness_max", 0.5))
+NEUTRAL_AF_CFG = FILTERING_CFG.get("neutral_af_filter", {})
+NEUTRAL_AF_ENABLED = _as_bool(NEUTRAL_AF_CFG.get("enabled", True), True)
+NEUTRAL_MIN_AF = float(NEUTRAL_AF_CFG.get("min_af", 0.025))
+NEUTRAL_MAX_AF = float(NEUTRAL_AF_CFG.get("max_af", 0.975))
+
+
+rule all:
+    input:
+        FILTERED_VCF,
+        FILTERED_VCF + ".tbi",
+        os.path.join(final_path, "phylogeny", "nj_tree.pdf"),
+        os.path.join(FREEBAYES_VCF_DIR, "missingness_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "missingness_filtered.stats.txt"),
+        os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.vcf.gz.tbi"),
+        os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.stats.txt"),
+        os.path.join(FREEBAYES_VCF_DIR, "af_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "af_filtered.vcf.gz.tbi"),
+        os.path.join(FREEBAYES_VCF_DIR, "af_filtered.stats.txt"),
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.stats.txt"),
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.ld_pruned.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.ld_pruned.stats.txt"),
+        SAMPLE_POP_UNIQUE,
+        SAMPLE_PLOIDY_UNIQUE,
+        SAMPLE_PLOIDY_COLCHITETRA
+
+
+rule write_sample_pop_unique:
+    input:
+        metafile=METAFILE
+    output:
+        tsv=SAMPLE_POP_UNIQUE
+    run:
+        df = pd.read_csv(input.metafile, sep='\t', dtype=str)
+        outdir = os.path.dirname(output.tsv)
+        os.makedirs(outdir, exist_ok=True)
+        out = df[["sample", POP_COL]].dropna().drop_duplicates()
+        out.columns = ["sample", "pop"]
+        out.to_csv(output.tsv, sep='\t', index=False, header=False)
+
+
+rule write_sample_ploidy_unique:
+    input:
+        metafile=METAFILE
+    output:
+        ploidy=SAMPLE_PLOIDY_UNIQUE,
+        colchitetra=SAMPLE_PLOIDY_COLCHITETRA
+    run:
+        df = pd.read_csv(input.metafile, sep='\t', dtype=str)
+
+        outdir = os.path.dirname(output.ploidy)
+        os.makedirs(outdir, exist_ok=True)
+
+        out = df[["sample", "ploidy"]].dropna().drop_duplicates()
+        out.columns = ["sample", "ploidy"]
+        out["ploidy"] = out["ploidy"].astype(str).replace({'2': 'diploid', '4': 'tetraploid'})
+        out.to_csv(output.ploidy, sep='\t', index=False, header=False)
+
+        ct = out[out["sample"].astype(str).str.endswith("CT")].copy()
+        ct["ploidy"] = "colchitetraploid"
+        ct.to_csv(output.colchitetra, sep='\t', index=False, header=False)
+
+
+rule filter_freebayes_site_quality:
+    input:
+        vcf=FILTERED_VCF,
+        index=FILTERED_VCF + ".tbi"
+    output:
+        os.path.join(FREEBAYES_VCF_DIR, "site_quality_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "site_quality_filtered.vcf.gz.tbi")
+    threads:
+        8
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view --threads {threads} -O z -o {output[0]} {input.vcf}
+        bcftools index --tbi {output[0]}
+        """
+
+
+rule Filter_missingness_freebayes:
+    input:
+        vcf=os.path.join(FREEBAYES_VCF_DIR, "site_quality_filtered.vcf.gz")
+    output:
+        os.path.join(FREEBAYES_VCF_DIR, "missingness_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "missingness_filtered.stats.txt")
+    threads:
+        8
+    params:
+        outputpath=FREEBAYES_VCF_DIR + "/",
+        missingness_expr=f"F_MISSING <= {MISSINGNESS_MAX}"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        bcftools view --threads {threads} -O v -i '{params.missingness_expr}' {input.vcf} |\
+            vcffixup - | \
+            bcftools view --threads {threads} -O z > {params.outputpath}missingness_filtered.vcf.gz
+        bcftools index --tbi {params.outputpath}missingness_filtered.vcf.gz
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}missingness_filtered.vcf.gz > {params.outputpath}missingness_filtered.stats.txt
+        """
+
+
+rule filter_BIALLELIC_SNP_freebayes:
+    input:
+        vcf=os.path.join(FREEBAYES_VCF_DIR, "missingness_filtered.vcf.gz")
+    output:
+        os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.vcf.gz.tbi"),
+        os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.stats.txt")
+    threads:
+        16
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        r"""
+        bcftools view --threads {threads} -v snps -m2 -M2 {input.vcf} -Oz -o {output[0]}
+        bcftools index --tbi {output[0]}
+        bcftools stats --threads {threads} -s- --verbose {output[0]} > {output[2]}
+        """
+
+
+rule FilterVCFminAF_freebayes:
+    input:
+        vcf=os.path.join(FREEBAYES_VCF_DIR, "biallelic_snp_filtered.vcf.gz")
+    output:
+        os.path.join(FREEBAYES_VCF_DIR, "af_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "af_filtered.vcf.gz.tbi"),
+        os.path.join(FREEBAYES_VCF_DIR, "af_filtered.stats.txt")
+    threads:
+        16
+    params:
+        outputpath=FREEBAYES_VCF_DIR + "/",
+        af_enabled=str(NEUTRAL_AF_ENABLED).lower(),
+        min_af=NEUTRAL_MIN_AF,
+        max_af=NEUTRAL_MAX_AF
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        if [ "{params.af_enabled}" = "true" ]; then
+            bcftools view --threads {threads} -O v --min-af {params.min_af} --max-af {params.max_af} {input.vcf} |\
+                vcffixup - | \
+                bcftools view --threads {threads} -O z > {params.outputpath}af_filtered.vcf.gz
+        else
+            bcftools view --threads {threads} -O z -o {params.outputpath}af_filtered.vcf.gz {input.vcf}
+        fi
+        bcftools index --tbi {params.outputpath}af_filtered.vcf.gz
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}af_filtered.vcf.gz > {params.outputpath}af_filtered.stats.txt
+        """
+
+
+rule filter_4_fold_degenerate_freebayes:
+    input:
+        reference=GENOME,
+        vcf=os.path.join(FREEBAYES_VCF_DIR, "af_filtered.vcf.gz"),
+        degenerate=os.path.join(final_path, "degeneracy", "degeneracy-fourfold.bed")
+    output:
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.stats.txt")
+    threads:
+        8
+    params:
+        outputpath=FREEBAYES_VCF_DIR + "/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        gatk SelectVariants \
+            -R {input.reference} \
+            -V {input.vcf} \
+            -O {params.outputpath}4_fold_degenerate_filtered.vcf.gz \
+            -L {input.degenerate} \
+            --select-type SNP \
+            --restrict-alleles-to BIALLELIC
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}4_fold_degenerate_filtered.vcf.gz > {params.outputpath}4_fold_degenerate_filtered.stats.txt
+        """
+
+
+rule LD_pruning_freebayes:
+    input:
+        reference=GENOME,
+        vcf=os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.vcf.gz")
+    output:
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.ld_pruned.vcf.gz"),
+        os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.ld_pruned.stats.txt")
+    threads:
+        16
+    params:
+        outputpath=FREEBAYES_VCF_DIR + "/"
+    conda:
+        "../env/gatk4_calling_env.yaml"
+    shell:
+        """
+        variant_count=$(bcftools view -H {input.vcf} | wc -l)
+        if [ "$variant_count" -eq 0 ]; then
+            bcftools view -Oz -o {params.outputpath}4_fold_degenerate_filtered.ld_pruned.vcf.gz {input.vcf}
+            bcftools index --tbi {params.outputpath}4_fold_degenerate_filtered.ld_pruned.vcf.gz
+        else
+            Rscript scripts/LD_prunning.R {input.vcf} {params.outputpath}4_fold_degenerate_filtered.ld_pruned.gds {params.outputpath}
+            gatk SelectVariants \
+                -R {input.reference} \
+                -V {input.vcf} \
+                -O {params.outputpath}4_fold_degenerate_filtered.ld_pruned.vcf.gz \
+                -L {params.outputpath}pruned_snps.intervals
+            bcftools index --tbi {params.outputpath}4_fold_degenerate_filtered.ld_pruned.vcf.gz
+        fi
+        bcftools stats -s- --threads {threads} --verbose {params.outputpath}4_fold_degenerate_filtered.ld_pruned.vcf.gz > {params.outputpath}4_fold_degenerate_filtered.ld_pruned.stats.txt
+        """
+
+
+rule make_nj_tree:
+    input:
+        vcf=os.path.join(FREEBAYES_VCF_DIR, "4_fold_degenerate_filtered.ld_pruned.vcf.gz"),
+        metadata=METAFILE
+    output:
+        final_path + "/phylogeny/nj_tree.pdf"
+    benchmark:
+        "benchmarks/vcf_annotation/nj_tree.txt"
+    threads:
+        4
+    resources:
+        mem_mb = 16000,
+        time = "2-0"
+    conda:
+        "../env/make_nj_tree.yaml"
+    shell:
+        """
+        Rscript scripts/make_nj_tree.R {input.vcf} {input.metadata} {output}
+        """

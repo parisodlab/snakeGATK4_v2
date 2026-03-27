@@ -1,16 +1,40 @@
+import os
+
 import pandas as pd
+
 configfile: "config_main.yaml"
 
-samples = pd.read_csv(config["METAFILE"],sep='\t').set_index(["prefix"], drop=False)
+samples = pd.read_csv(config["METAFILE"], sep="\t")
+
+if "sample_lane" not in samples.columns:
+    if {"sample", "lane", "sample_barcode"}.issubset(samples.columns):
+        samples["sample_lane"] = (
+            samples["sample"].astype(str)
+            + "_"
+            + samples["lane"].astype(str)
+            + "_"
+            + samples["sample_barcode"].astype(str)
+        )
+    elif {"sample", "lane"}.issubset(samples.columns):
+        samples["sample_lane"] = samples["sample"].astype(str) + "_" + samples["lane"].astype(str)
+    elif "prefix" in samples.columns:
+        samples["sample_lane"] = samples["prefix"].astype(str)
+    else:
+        raise ValueError(
+            "METAFILE must contain 'sample_lane' or ('sample' and 'lane' [and optionally 'sample_barcode']) or 'prefix'"
+        )
+
+samples["prefix"] = samples["sample_lane"].astype(str)
+samples = samples.set_index(["prefix"], drop=False)
+
 final_path = config["FINALOUTPUT"] + "/" + config["PROJECT"]
-input_path = config["INPUT"]
 
 wildcard_constraints:
-    prefix = "|".join(samples.index),
-    sample = "|".join(samples["sample"])
+    prefix = "[^/]+",
+    sample = "[^/]+"
 
-sample=samples["sample"]
-prefix=samples["prefix"]
+sample = samples["sample"].astype(str).unique().tolist()
+prefix = samples["prefix"].astype(str).tolist()
 
 # Define a function to get the fastq files for a given prefix
 def get_fastq(wildcards):
@@ -40,7 +64,7 @@ rule trim:
         report_html = final_path + "/fastp/{prefix}.html",
         report_json = final_path + "/fastp/{prefix}.json"
     benchmark:
-        final_path + "benchmarks/fastp/fastp_{prefix}.json"
+        "benchmarks/fastp/fastp_{prefix}.txt"
     params:
         compression_level="-9",
         minlen=25,  # Equivalent to MINLEN:25 in Trimmomatic
