@@ -23,7 +23,9 @@ import shutil
 import subprocess
 from pathlib import Path
 
+
 import yaml
+import csv
 
 
 BASE_SWAP = {"A": "T", "T": "A", "C": "G", "G": "C"}
@@ -47,10 +49,21 @@ def parse_args() -> argparse.Namespace:
 def load_generator_config(config_path: Path) -> dict:
   with config_path.open("rt", encoding="ascii") as handle:
     data = yaml.safe_load(handle) or {}
-  for key in ("reference_fasta", "annotation_gff", "contig", "region_start", "region_length", "coverage_levels"):
+  for key in ("reference_fasta", "annotation_gff", "contig", "region_start", "region_length", "coverage_levels", "lanes_per_sample", "variant_panel_tsv"):
     if key not in data:
       raise ValueError(f"Generator config must define '{key}'")
   return data
+
+
+def parse_variant_panel(panel_path: Path) -> dict:
+  """Parse variant_panel.tsv and return dict: {(sample, ploidy): [variant_dicts]}"""
+  panel = {}
+  with panel_path.open("rt", encoding="utf-8") as f:
+    reader = csv.DictReader(f, delimiter="\t")
+    for row in reader:
+      key = (row["sample"], int(row["ploidy"]))
+      panel.setdefault(key, []).append(row)
+  return panel
 
 
 def wrap_fasta(sequence: str, width: int = 80) -> str:
@@ -405,104 +418,118 @@ def build_pipeline_config(
 
 
 def main() -> None:
-  args = parse_args()
-  config_path = args.config.resolve()
-  generator_cfg = load_generator_config(config_path)
-  root = Path(__file__).resolve().parent
 
-  data_dir = root / "data"
-  ref_dir = data_dir / "reference"
-  fastq_dir = data_dir / "fastq"
-  results_dir = root / "results"
-  logs_dir = root / "logs"
-  tmp_dir = root / "tmp"
-  intervals_dir = root / "intervals"
+    args = parse_args()
+    config_path = args.config.resolve()
+    generator_cfg = load_generator_config(config_path)
+    root = Path(__file__).resolve().parent
 
-  ref_dir.mkdir(parents=True, exist_ok=True)
-  clear_reference_artifacts(ref_dir)
-  reset_output_dirs([fastq_dir, results_dir, logs_dir, tmp_dir, intervals_dir])
+    data_dir = root / "data"
+    ref_dir = data_dir / "reference"
+    fastq_dir = data_dir / "fastq"
+    results_dir = root / "results"
+    logs_dir = root / "logs"
+    tmp_dir = root / "tmp"
+    intervals_dir = root / "intervals"
 
-  rng = random.Random(args.seed)
-  mutation_rate = float(generator_cfg.get("mutation_rate", 0.003))
-  read_length = int(generator_cfg.get("read_length", 150))
-  iss_model = str(generator_cfg.get("iss_model", "novaseq"))
-  iss_cpus = int(generator_cfg.get("iss_cpus", 1))
-  tetraploid_dosage_weights = [("AAAa", 0.25), ("AAaa", 0.5), ("Aaaa", 0.25)]
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    clear_reference_artifacts(ref_dir)
+    reset_output_dirs([fastq_dir, results_dir, logs_dir, tmp_dir, intervals_dir])
 
-  reference_fasta = Path(str(generator_cfg["reference_fasta"]))
-  annotation_gff = Path(str(generator_cfg["annotation_gff"]))
-  contig = str(generator_cfg["contig"])
-  region_start = int(generator_cfg["region_start"])
-  region_length = int(generator_cfg["region_length"])
-  region_name = str(generator_cfg.get("region_name", f"{contig}_{region_start}_{region_start + region_length - 1}"))
+    rng = random.Random(args.seed)
+    mutation_rate = float(generator_cfg.get("mutation_rate", 0.003))
+    read_length = int(generator_cfg.get("read_length", 150))
+    iss_model = str(generator_cfg.get("iss_model", "novaseq"))
+    iss_cpus = int(generator_cfg.get("iss_cpus", 1))
+    tetraploid_dosage_weights = [("AAAa", 0.25), ("AAaa", 0.5), ("Aaaa", 0.25)]
+    lanes_per_sample = int(generator_cfg.get("lanes_per_sample", 1))
+    variant_panel_path = Path(generator_cfg["variant_panel_tsv"])
 
-  reference_sequence = read_fasta_region(reference_fasta, contig, region_start, region_length)
-  ref_path = ref_dir / "synthetic.fa"
-  ref_path.write_text(">chrSynthetic\n" + wrap_fasta(reference_sequence) + "\n", encoding="ascii")
+    reference_fasta = Path(str(generator_cfg["reference_fasta"]))
+    annotation_gff = Path(str(generator_cfg["annotation_gff"]))
+    contig = str(generator_cfg["contig"])
+    region_start = int(generator_cfg["region_start"])
+    region_length = int(generator_cfg["region_length"])
+    region_name = str(generator_cfg.get("region_name", f"{contig}_{region_start}_{region_start + region_length - 1}"))
 
-  gff_path = ref_dir / "synthetic.gff"
-  clipped_features = clip_gff(annotation_gff, contig, region_start, region_length, gff_path)
-  if clipped_features == 0:
-    raise ValueError("No annotation features overlapped the selected Biscutella region")
+    reference_sequence = read_fasta_region(reference_fasta, contig, region_start, region_length)
+    ref_path = ref_dir / "synthetic.fa"
+    ref_path.write_text(">chrSynthetic\n" + wrap_fasta(reference_sequence) + "\n", encoding="ascii")
 
-  mutation_positions = choose_mutation_positions(reference_sequence, mutation_rate, rng)
-  diploid_haplotypes, diploid_records = build_diploid_haplotypes(reference_sequence, mutation_positions, rng)
-  tetraploid_haplotypes, tetraploid_records = build_tetraploid_haplotypes(
-    reference_sequence,
-    mutation_positions,
-    tetraploid_dosage_weights,
-    rng,
-  )
+    gff_path = ref_dir / "synthetic.gff"
+    clipped_features = clip_gff(annotation_gff, contig, region_start, region_length, gff_path)
+    if clipped_features == 0:
+        raise ValueError("No annotation features overlapped the selected Biscutella region")
 
-  draft_specs = [
-    (2, diploid_haplotypes, diploid_records, "2x"),
-    (4, tetraploid_haplotypes, tetraploid_records, "4x"),
-  ]
+    # Parse variant panel
+    panel = parse_variant_panel(variant_panel_path)
 
-  metadata_lines = ["sample\tlane\tpop\tploidy\tfq1\tfq2"]
-  for ploidy, haplotypes, records, label in draft_specs:
-    draft_path = ref_dir / f"{region_name}_{label}.fas"
-    alignment_path = ref_dir / f"{region_name}_{label}_alignment.fas"
-    snp_pos_path = ref_dir / f"{region_name}_{label}_snp_pos.txt"
-    vcf_path = ref_dir / f"{region_name}_{label}.vcf"
+    metadata_lines = ["sample\tlane\tpop\tploidy\tfq1\tfq2"]
+    for (sample, ploidy), variants in panel.items():
+        label = f"{ploidy}x"
+        # Build haplotypes for this sample using the variant panel
+        hap_count = ploidy
+        haplotypes = [list(reference_sequence) for _ in range(hap_count)]
+        snp_records = []
+        for v in variants:
+            pos = int(v["position"]) - 1
+            alt = v["alt"]
+            dosage = int(v["dosage"])
+            # Assign alt alleles to haplotypes (simple: first N)
+            for h in range(dosage):
+                haplotypes[h][pos] = alt
+            snp_records.append({
+                "position": pos + 1,
+                "ref": reference_sequence[pos],
+                "alt": alt,
+                "dosage": dosage,
+                "alt_haplotypes": ",".join(f"hap{h+1}" for h in range(dosage))
+            })
+        haplotype_records = [(f"{sample}_{label}_hap{h+1}", "".join(seq)) for h, seq in enumerate(haplotypes)]
+        draft_path = ref_dir / f"{sample}_{label}.fas"
+        alignment_path = ref_dir / f"{sample}_{label}_alignment.fas"
+        snp_pos_path = ref_dir / f"{sample}_{label}_snp_pos.txt"
+        vcf_path = ref_dir / f"{sample}_{label}.vcf"
 
-    write_fasta_records(draft_path, [(f"{region_name}_{label}_{name}", sequence) for name, sequence in haplotypes])
-    write_fasta_records(
-      alignment_path,
-      [("chrSynthetic", reference_sequence)] + [(f"{region_name}_{label}_{name}", sequence) for name, sequence in haplotypes],
+        write_fasta_records(draft_path, haplotype_records)
+        write_fasta_records(
+            alignment_path,
+            [("chrSynthetic", reference_sequence)] + haplotype_records,
+        )
+        write_snp_positions(snp_pos_path, snp_records)
+        create_vcf_with_snp_sites(alignment_path, vcf_path)
+
+        for coverage in generator_cfg["coverage_levels"]:
+            for lane in range(1, lanes_per_sample + 1):
+                lane_id = f"L{lane:03d}"
+                fq_sample = f"{sample}_{label}_cov{coverage}x"
+                output_prefix = fastq_dir / f"{fq_sample}_{lane_id}"
+                fq1, fq2 = simulate_reads(
+                    draft_fasta=draft_path,
+                    output_prefix=output_prefix,
+                    coverage=int(coverage),
+                    sequence_length=len(reference_sequence),
+                    read_length=read_length,
+                    model=iss_model,
+                    cpu_count=iss_cpus,
+                )
+                metadata_lines.append(f"{fq_sample}\t{lane_id}\t{label}\t{ploidy}\t{fq1}\t{fq2}")
+
+    metadata_path = data_dir / "metadata.tsv"
+    metadata_path.write_text("\n".join(metadata_lines) + "\n", encoding="ascii")
+
+    config_fake_path = root / "config.fake.yaml"
+    config_fake_path.write_text(
+        yaml.safe_dump(build_pipeline_config(root, ref_path, gff_path, metadata_path, generator_cfg), sort_keys=False),
+        encoding="ascii",
     )
-    write_snp_positions(snp_pos_path, records)
-    create_vcf_with_snp_sites(alignment_path, vcf_path)
 
-    for coverage in generator_cfg["coverage_levels"]:
-      sample = f"{region_name}_{label}_cov{coverage}x"
-      output_prefix = fastq_dir / f"{sample}_{LANE}"
-      fq1, fq2 = simulate_reads(
-        draft_fasta=draft_path,
-        output_prefix=output_prefix,
-        coverage=int(coverage),
-        sequence_length=len(reference_sequence),
-        read_length=read_length,
-        model=iss_model,
-        cpu_count=iss_cpus,
-      )
-      metadata_lines.append(f"{sample}\t{LANE}\t{label}\t{ploidy}\t{fq1}\t{fq2}")
-
-  metadata_path = data_dir / "metadata.tsv"
-  metadata_path.write_text("\n".join(metadata_lines) + "\n", encoding="ascii")
-
-  config_fake_path = root / "config.fake.yaml"
-  config_fake_path.write_text(
-    yaml.safe_dump(build_pipeline_config(root, ref_path, gff_path, metadata_path, generator_cfg), sort_keys=False),
-    encoding="ascii",
-  )
-
-  print(f"Wrote Biscutella region fixture under {root}")
-  print(f"Region: {contig}:{region_start}-{region_start + region_length - 1}")
-  print(f"Reference: {ref_path}")
-  print(f"Annotation: {gff_path}")
-  print(f"Metadata: {metadata_path}")
-  print(f"Config: {config_fake_path}")
+    print(f"Wrote Biscutella region fixture under {root}")
+    print(f"Region: {contig}:{region_start}-{region_start + region_length - 1}")
+    print(f"Reference: {ref_path}")
+    print(f"Annotation: {gff_path}")
+    print(f"Metadata: {metadata_path}")
+    print(f"Config: {config_fake_path}")
 
 
 if __name__ == "__main__":

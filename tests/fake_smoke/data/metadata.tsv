@@ -1,13 +1,5 @@
 sample	lane	pop	ploidy	fq1	fq2
-Dip1	L001	DipPopA	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip1_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip1_L001_R2.fastq.gz
-Dip1	L002	DipPopA	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip1_L002_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip1_L002_R2.fastq.gz
-Dip2	L001	DipPopA	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip2_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip2_L001_R2.fastq.gz
-Dip2	L002	DipPopA	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip2_L002_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip2_L002_R2.fastq.gz
-Dip3	L001	DipPopB	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip3_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip3_L001_R2.fastq.gz
-Dip3	L002	DipPopB	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip3_L002_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Dip3_L002_R2.fastq.gz
-Tet1	L001	TetPopA	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet1_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet1_L001_R2.fastq.gz
-Tet1	L002	TetPopA	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet1_L002_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet1_L002_R2.fastq.gz
-Tet2	L001	TetPopA	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet2_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet2_L001_R2.fastq.gz
-Tet2	L002	TetPopA	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet2_L002_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet2_L002_R2.fastq.gz
-Tet3	L001	TetPopB	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet3_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet3_L001_R2.fastq.gz
-Tet3	L002	TetPopB	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet3_L002_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Tet3_L002_R2.fastq.gz
+Bv3_1_10000000_2x_cov20x	L001	2x	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_2x_cov20x_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_2x_cov20x_L001_R2.fastq.gz
+Bv3_1_10000000_2x_cov5x	L001	2x	2	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_2x_cov5x_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_2x_cov5x_L001_R2.fastq.gz
+Bv3_1_10000000_4x_cov20x	L001	4x	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_4x_cov20x_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_4x_cov20x_L001_R2.fastq.gz
+Bv3_1_10000000_4x_cov5x	L001	4x	4	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_4x_cov5x_L001_R1.fastq.gz	/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq/Bv3_1_10000000_4x_cov5x_L001_R2.fastq.gz

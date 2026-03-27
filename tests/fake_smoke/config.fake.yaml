@@ -1,36 +1,36 @@
-PROJECT: "synthetic_smoke"
-variant_caller: "gatk"
-QC: no
-TRIMMING: "no"
-SEQTYPE: "ddrad"
-GENOME: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.fa"
-ANNOTATION: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.gff"
-SCAFFOLDS: "ALL"
-METAFILE: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/metadata.tsv"
-INPUT: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq"
-FINALOUTPUT: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/results"
-log_folder: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/logs"
-tmpdir: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/tmp"
-scatter_mode: "chromosome"
-haplotypecaller_scatter_mode: "chromosome"
-jointgenotyping_scatter_mode: "chromosome"
-chromosome_groups: "all"
-haplotypecaller_chromosome_groups: "all"
-jointgenotyping_chromosome_groups: "all"
-intervals_dir: "/data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/intervals"
+PROJECT: synthetic_smoke
+variant_caller: gatk
+QC: 'no'
+TRIMMING: 'no'
+SEQTYPE: ddrad
+GENOME: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.fa
+ANNOTATION: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/reference/synthetic.gff
+SCAFFOLDS: ALL
+METAFILE: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/metadata.tsv
+INPUT: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/data/fastq
+FINALOUTPUT: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/results
+log_folder: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/logs
+tmpdir: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/tmp
+scatter_mode: chromosome
+haplotypecaller_scatter_mode: chromosome
+jointgenotyping_scatter_mode: chromosome
+chromosome_groups: all
+haplotypecaller_chromosome_groups: all
+jointgenotyping_chromosome_groups: all
+intervals_dir: /data/users/rchoudhury/snakeSNPcalling/tests/fake_smoke/intervals
 scatter_count: 1
 haplotypecaller_scatter_count: 1
 jointgenotyping_scatter_count: 1
 HaplotypeCaller:
-  minConfidenceForVariantCalling: "20"
+  minConfidenceForVariantCalling: '20'
   minimum_mapping_quality: 10
   by_scatter_mode:
     chromosome:
       threads: 1
       mem_mb: 4000
-      time: "1-0"
-      java_xms: "1G"
-      java_xmx: "2G"
+      time: 1-0
+      java_xms: 1G
+      java_xmx: 2G
   min_depth: 1
   qual: 10.0
   strand_odds_ratio: 10.0
@@ -42,12 +42,12 @@ HaplotypeCaller:
   high_missing: 1.0
   high_heterozygosity: 1.0
 GenotypeGVCFs:
-  minConfidenceForVariantCalling: "10"
+  minConfidenceForVariantCalling: '10'
   by_scatter_mode:
     chromosome:
       threads: 1
       mem_mb: 4000
-      time: "1-0"
+      time: 1-0
       java_heap_mb: 2000
       max_alternate_alleles: 12
       only_output_calls_starting_in_intervals: false
@@ -56,8 +56,8 @@ GenomicsDBImport:
     chromosome:
       threads: 1
       mem_mb: 4000
-      java_xms: "1G"
-      java_xmx: "2G"
+      java_xms: 1G
+      java_xmx: 2G
       batch_size: 50
       interval_padding: 0
       merge_input_intervals: false
@@ -92,6 +92,28 @@ VariantFiltering:
     min_af: 0.0
     max_af: 1.0
   popgen_stats_use_af_filtered: false
+SyntheticFixture:
+  reference_fasta: /data/users/rchoudhury/Biscutella_Genomes/Biscutella_centromeres_and_chromosome_evolution/Genome_assemblies/Varia_review2.FINAL.Syri.fa
+  annotation_gff: /data/users/rchoudhury/Biscutella_Genomes/Biscutella_centromeres_and_chromosome_evolution/Genome_annotations/Genes/Varia.all.maker.renamed.gff
+  contig: Bv3
+  region_start: 1
+  region_length: 10000000
+  coverage_levels:
+  - 20
+  - 5
+  ploidies:
+  - 2
+  - 4
+  mutation_rate: 0.003
+  substitution_model: C<->G, A<->T
+  diploid_dosage_scheme:
+    Aa: 1.0
+  tetraploid_dosage_scheme:
+    AAAa: 0.25
+    AAaa: 0.5
+    Aaaa: 0.25
+  iss_model: novaseq
+  read_length: 150
 final_vcf_neutral: null
 final_vcf: null
 final_vcf_full: null

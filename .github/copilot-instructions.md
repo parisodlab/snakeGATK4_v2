@@ -1,24 +1,52 @@
-# HPC execution policy
+---
+description: Bioinformatics & HPC workflow coding and project guidelines for Copilot. Load for any bioinformatics, genomics, or computational biology project in this workspace.
+# applyTo: 'Bioinformatics, genomics, computational biology, Snakemake, SLURM, Python, R, shell scripts, HPC workflows'
+---
 
-All non-trivial commands must follow this workflow:
+## Project Context & Coding Guidelines
 
-1. Never run long or compute-heavy commands on the login node.
-2. First ensure execution happens inside a persistent `screen` session on the login node.
-3. Before running a task, estimate the minimum required walltime, memory, and CPU from:
-   - the type of task groups you have to run (e.g., alignment, variant calling, annotation)
-   - input size 
-   - previous benchmark files if available
-   - try to be conservative in your estimation, and report any assumptions you make.
-   - increase the estimate if you are uncertain, but do not overestimate by more than 2x.
-   - If it crashes, you can always adjust the estimate and rerun the task.
-4. Request a compute node or submit a job using those estimated resources.
-5. Run each group of tasks in its own isolated execution context:
-   - separate `screen` session, or
-   - separate scheduler job
+- Use for bioinformatics, genomics, and computational biology projects.
+- Tools: Snakemake, Python, R, shell scripts, SLURM.
+- Each project: data/, scripts/, results/, config/ folders.
+- Prioritize reproducibility, modularity, and clear documentation.
 
-## Hard rules
+### Coding Preferences
+- Write readable, well-commented code with descriptive, domain-relevant names (e.g., sample_id, fasta_path).
+- Scripts must include a docstring/header and usage example.
+- Prefer relative paths; avoid hardcoded directories.
 
-- Never request a node before creating or attaching a `screen` session.
-- Never run heavy commands directly in the login shell.
-- If resource estimation is uncertain, choose the smallest safe profile and report the assumption.
+### Workflow & Pipeline Guidance
+- Snakemake: Use config files, modular rules, clear input/output paths.
+- R: Prefer tidyverse style, reproducible research practices.
+- Shell: Ensure portability, error handling, resource checks.
+- Output results to organized results/ or logs/ folders.
+
+### HPC Execution Policy
+- Never run compute-heavy jobs on the login node.
+- Always use a persistent `screen` session before requesting a compute node.
+- Before running any long job, get into the habit of checking the current node with `hostname` and ensuring you are on a compute node, not the login node. Login node is `login8.hpc.binf.unibe.ch`. Go to the compute node using `srun` or `sbatch` and then run your job from there. for example:
+  shopt -s expand_aliases && source "$HOME/.bash_profile" && srun -p pibu_el8 -c 1 --mem=2G --time=00:15:00 --pty /bin/bash
+- Estimate walltime, memory, and CPU based on task/input size and benchmarks; document assumptions.
 - Each task must run in its own isolated session or scheduler allocation.
+
+### Data Handling
+- For large files (FASTA, VCF, BAM): use efficient file handling/streaming.
+- Organize outputs/logs by project and analysis step.
+
+### Collaboration
+- Write code that is easy to share and rerun by others.
+- Update README files and document new scripts/workflows.
+- Use environment files (conda, requirements.txt) for reproducibility.
+
+- Write code that is easy to share and rerun by others.
+- Update README files and document any new scripts or workflows.
+- Use environment files (e.g., conda, requirements.txt) for reproducibility.
+
+---
+
+## How to Use These Instructions
+
+- Place these guidelines in your copilot-instructions.md file.
+- Review them before starting new scripts or pipelines.
+- Update as your workflow or tools evolve.
+- When using Copilot or Copilot Chat, refer to these instructions to ensure code suggestions match your standards.

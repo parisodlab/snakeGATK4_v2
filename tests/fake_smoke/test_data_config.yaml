@@ -11,3 +11,7 @@ mutation_rate: 0.003
 read_length: 150
 iss_model: novaseq
 iss_cpus: 1
+# Number of sequencing lanes per sample
+lanes_per_sample: 1
+# Path to the variant panel TSV
+variant_panel_tsv: snakeSNPcalling/tests/fake_smoke/data/variant_panel.tsv
