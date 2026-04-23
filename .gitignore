@@ -44,3 +44,7 @@ scatter_units.list
 configs/samples.tsv
 
 *.list
+*.errlog
+seed.txt
+temp.sh
+
