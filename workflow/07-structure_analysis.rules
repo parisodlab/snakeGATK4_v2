@@ -7,39 +7,98 @@ import pandas as pd
 configfile: "config_main.yaml"
 
 
-final_path = os.path.join(config["FINALOUTPUT"], config["PROJECT"])
+final_path = config["FINALOUTPUT"]+"/"+config["PROJECT"]
+logs_path = config["log_folder"]
 VARIANT_CALLER = str(config.get("variant_caller", "gatk")).strip().lower()
 
 
-def _caller_default_neutral_vcf():
+def _default_structure_vcf():
     if VARIANT_CALLER == "freebayes":
-        return os.path.join(final_path, "freebayes", "final_vcf", "4_fold_degenerate_filtered.ld_pruned.vcf.gz")
+        return os.path.join(final_path, "freebayes", "final_vcf", "filtered.vcf.gz")
     return os.path.join(final_path, "gatk4", "final_vcf", "4_fold_degenerate_filtered.ld_pruned.vcf.gz")
 
-# Default VCF used for STRUCTURE-related neutral-SNP analyses.
-FINAL_VCF = config.get("final_vcf_neutral") or config.get("final_vcf") or _caller_default_neutral_vcf()
+def _get_structure_populations():
+    """Get populations from config, return 'all' if not specified or if set to 'all'"""
+    pops = config.get("Structure", {}).get("populations", "all")
+    if isinstance(pops, str):
+        return pops
+    if isinstance(pops, list):
+        return pops
+    return "all"
+
+print("Final output path:", final_path)
 
 
-rule all:
-    input:
-        final_path + "/pca/pca_" + config["PCA"]["ploidy"] + ".pdf",
-        os.path.join(final_path, "structure", "harvester_output", "evanno.txt"),
-        os.path.join(final_path, "structure", "harvester_output", "bestK.txt"),
-        os.path.join(final_path, "structure", "clumpp", "clumpp_done.txt")
 
 
 
 # Set parameters for Structure analysis
-
 MODE   = config["Structure"]["run_mode"]
 KS     = config["Structure"]["ks"]
 REPS   = config["Structure"]["replicates"]
 BURNIN = config["Structure"]["burnin"]
 MCMC   = config["Structure"]["mcmc"]
+STRUCTURE_INPUT_VCF = config.get("final_vcf_neutral") or config.get("final_vcf") or _default_structure_vcf()
+MISSINGNESS_THRESHOLD = config.get("Structure", {}).get("missingness_threshold", 0.025)
+STRUCTURE_POPULATIONS = _get_structure_populations()
+rule all:
+    input:
+        [
+        final_path + "/pca/pca_" + config["PCA"]["ploidy"] + ".pdf",
+        os.path.join(final_path, "structure", "harvester_output", "evanno.txt"),
+        os.path.join(final_path, "structure", "harvester_output", "bestK.txt"),
+        os.path.join(final_path, "structure", "clumpp", "clumpp_done.txt"),
+        ] + expand(
+            final_path + "/structure/results/K{K}_rep{r}_f",
+            K=KS,
+            r=range(1, REPS + 1)
+        )
+
+
+
+# Rule: Filter VCF for loci with missingness ≤ 10% and optionally subset by populations
+rule filter_vcf_locus_missingness:
+    input:
+        vcf=STRUCTURE_INPUT_VCF,
+        metadata=config["METAFILE"]
+    output:
+       vcf=final_path + "/gatk4/final_vcf/structure.locusmiss" + str(MISSINGNESS_THRESHOLD) + ".vcf.gz"
+    params:
+        missingness_threshold=MISSINGNESS_THRESHOLD,
+        populations=STRUCTURE_POPULATIONS,
+        metadata_file=config["METAFILE"]
+    run:
+        import pandas as pd
+        import subprocess
         
+        populations = params.populations
+        
+        # Build sample filter if populations specified
+        sample_filter = ""
+        if populations != "all":
+            # Read metadata
+            metadata = pd.read_csv(params.metadata_file, sep='\t')
+            
+            # Ensure populations is a list
+            if isinstance(populations, str):
+                populations = [populations]
+            
+            # Get samples for these populations
+            pop_samples = metadata[metadata['pop'].isin(populations)]['sample'].tolist()
+            sample_filter = f"-s {','.join(pop_samples)}"
+            print(f"Filtering to populations: {populations}")
+            print(f"Selected {len(pop_samples)} samples: {pop_samples}")
+        else:
+            print("Including all populations in VCF")
+        
+        # Run bcftools commands
+        subprocess.run(f"bcftools view -Oz -i 'F_MISSING<={params.missingness_threshold}' {sample_filter} {input.vcf} > {output.vcf}", shell=True, check=True)
+        subprocess.run(f"tabix -f {output.vcf}", shell=True, check=True)
+        subprocess.run(f"bcftools stats -s - {output.vcf} > {output.vcf}.stats.txt", shell=True, check=True)
+
 rule count_vcf_stats:
     input:
-        vcf=FINAL_VCF
+        vcf=final_path + "/gatk4/final_vcf/structure.locusmiss" + str(MISSINGNESS_THRESHOLD) + ".vcf.gz"
     output:
         inds=final_path + "/structure/num_inds.txt",
         loci=final_path + "/structure/num_loci.txt"
@@ -67,13 +126,13 @@ rule count_vcf_stats:
 
 rule convert_vcf_to_structure:
     input:
-        vcf=FINAL_VCF
+        vcf=final_path + "/gatk4/final_vcf/structure.locusmiss" + str(MISSINGNESS_THRESHOLD) + ".vcf.gz"
     output:
         structure=final_path + "/structure/structure.str"
     conda:
         "../env/structure_env.yaml"
     params:
-        outputpath = os.path.join(final_path, "structure")
+        outputpath = final_path + "/structure"
     shell:
         """
         python scripts/VCF_to_STRUCTURE.py -v {input.vcf} \
@@ -127,7 +186,7 @@ rule generate_structure_params:
 #define EXTRACOLS 0
 #define MISSING -9
 """
-
+        
         # Define extraparams content
         extraparams_content = """\
 #define NOADMIX 0
@@ -161,6 +220,8 @@ rule generate_structure_params:
 
 #define UPDATEFREQ 5000
 #define RANDOMIZE 0
+#define PRINTNET 1
+#define PRINTQHAT 1
 
 """
 
@@ -171,7 +232,10 @@ rule generate_structure_params:
         with open(output.extraparams, "w") as f:
             f.write(extraparams_content)
 
-
+rule structure_all_runs:
+    input:
+        expand(final_path + "/structure/results/K{K}_rep{r}_f",
+               K=KS, r=range(1, REPS+1))
 
 rule run_structure:
     input:
@@ -181,7 +245,8 @@ rule run_structure:
         mainparams=final_path + "/structure/params/mainparams",
         extraparams=final_path + "/structure/params/extraparams"
     output:
-        final_path + "/structure/results/K{K}_rep{r}_f"
+        final_path + "/structure/results/K{K}_rep{r}_f",
+        q=final_path + "/structure/results/K{K}_rep{r}_q"
     conda:
         "../env/structure_env.yaml"
     params:
@@ -202,7 +267,48 @@ rule run_structure:
         """
 
 
+rule triangle_plot_k3:
+    input:
+        q=final_path + "/structure/results/K3_rep1_q",
+        metadata=config["METAFILE"]
+    output:
+        pdf=final_path + "/structure/plots/K3_rep1_triangle.pdf"
+    conda:
+        "../env/structure_plot.yaml"
+    shell:
+        """
+        python scripts/plot_structure_triangle.py {input.q} {input.metadata} {output.pdf}
+        """
 
+rule parse_structure_netdist:
+    input:
+        f=final_path + "/structure/results/K{K}_rep{r}_f"
+    output:
+        tsv=final_path + "/structure/netdist/K{K}_rep{r}_netdist.tsv"
+    run:
+        import re
+        import pandas as pd
+
+        with open(input.f) as fh:
+            txt = fh.read()
+
+        m = re.search(
+            r"Allele-frequency divergence among clusters.*?\n(.*?)(?:\n\n|\Z)",
+            txt,
+            flags=re.S
+        )
+        if not m:
+            raise ValueError(f"Could not find net nucleotide distance block in {input.f}")
+
+        block = m.group(1).strip().splitlines()
+        rows = []
+        for line in block:
+            parts = line.strip().split()
+            if len(parts) >= 2:
+                rows.append(parts)
+
+        df = pd.DataFrame(rows)
+        df.to_csv(output.tsv, sep="\t", index=False, header=False)
 
 rule structure_harvester:
     input:
@@ -265,7 +371,7 @@ rule clumpp:
 
 rule glpca_diploid:
     input:
-        vcf=FINAL_VCF,
+        vcf=final_path + "/gatk4/final_vcf/structure.locusmiss" + str(MISSINGNESS_THRESHOLD) + ".vcf.gz",
         metadata=config["METAFILE"]
     output:
         pdf=final_path +"/pca/pca_diploid.pdf"
@@ -286,7 +392,7 @@ rule glpca_diploid:
         genlight_obj <- vcfR2genlight(vcf)
 
         # Read metadata
-        metadata <- read.table("{input.metadata}", header = TRUE, stringsAsFactors = FALSE)
+        metadata <- readr::read_tsv("{input.metadata}", show_col_types = FALSE)
         metadata <- metadata %>%
             select(sample, pop) %>%
             distinct() %>%
@@ -351,7 +457,7 @@ rule glpca_diploid:
 
 rule glpca_tetraploid:
     input:
-        vcf=FINAL_VCF,
+        vcf=final_path + "/gatk4/final_vcf/structure.locusmiss" + str(MISSINGNESS_THRESHOLD) + ".vcf.gz",
         metadata=config["METAFILE"]
     output:
         pdf=final_path + "/pca/pca_tetraploid.pdf"
@@ -374,7 +480,7 @@ rule glpca_tetraploid:
         vcf <- read.vcfR("{input.vcf}")
 
         # Read metadata
-        metadata <- read.table("{input.metadata}", header = TRUE, stringsAsFactors = FALSE)
+        metadata <- readr::read_tsv("{input.metadata}", show_col_types = FALSE)
         metadata <- metadata %>%
             select(sample, pop) %>%
             distinct() %>%
@@ -441,7 +547,7 @@ rule glpca_tetraploid:
 
 rule mixedploidy_pca:
     input:
-        vcf=FINAL_VCF,
+        vcf=final_path + "/gatk4/final_vcf/structure.locusmiss" + str(MISSINGNESS_THRESHOLD) + ".vcf.gz",
         metadata=config["METAFILE"]
     output:
         pdf=final_path + "/pca/pca_mixed.pdf"
@@ -478,7 +584,7 @@ rule mixedploidy_pca:
         )
 
         # Read metadata and merge
-        metadata <- read.table("{input.metadata}", header=TRUE, stringsAsFactors=FALSE) %>%
+        metadata <- readr::read_tsv("{input.metadata}", show_col_types=FALSE) %>%
             select(sample, pop) %>%
             distinct() %>%
             rename(Population = pop)

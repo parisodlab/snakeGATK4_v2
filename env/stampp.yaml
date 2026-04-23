@@ -1,0 +1,10 @@
+name: stampp_env
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - r-base
+  - r-vcfr
+  - r-dplyr
+  - r-stampp

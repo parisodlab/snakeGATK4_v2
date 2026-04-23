@@ -41,7 +41,7 @@ SCAFFOLDS:
 # Typical required columns are sample, ploidy, fq1, fq2, plus either sample_lane,
 # or enough columns to reconstruct it (sample/lane[/sample_barcode]).
 METAFILE:
-    "/data/users/rchoudhury/snakeSNPcalling/configs/metadata_fixed.tsv"
+    "/data/users/rchoudhury/snakeSNPcalling/configs/metadata_fixed_A2Sch-X.tsv"
 
 # INPUT points to the read root used by the broader workflow.
 # FINALOUTPUT is the base output directory; PROJECT is appended under it.
@@ -64,7 +64,7 @@ scatter_mode: "interval" # default fallback for calling stages that do not overr
 # Recommended:
 # - chromosome for chromosome-scale assemblies, often with Bv1-9+rest
 # - interval when you need more balanced per-sample jobs
-haplotypecaller_scatter_mode: "interval" # "chromosome" or "interval"
+haplotypecaller_scatter_mode: "chromosome" # "chromosome" or "interval"
 
 # Joint genotyping scatter scheme used by GenomicsDBImport + GenotypeGVCFs.
 # Recommended:
@@ -77,8 +77,8 @@ chromosome_groups: "all" # default fallback for stage-specific chromosome groups
 # When scatter_mode is chromosome, valid values are:
 # - all
 # - a prefix-range-rest pattern such as Bv1-9+rest
-haplotypecaller_chromosome_groups: "all" # "all" or a range+rest pattern such as "Bv1-9+rest"
-jointgenotyping_chromosome_groups: "all" # "all" or a range+rest pattern such as "Bv1-9+rest"
+haplotypecaller_chromosome_groups: "Bv1-9+rest" # "all" or a range+rest pattern such as "Bv1-9+rest"
+jointgenotyping_chromosome_groups: "Bv1-9+rest" # "all" or a range+rest pattern such as "Bv1-9+rest"
 
 # Base directory for interval files. The workflow will create stage-specific subdirectories here.
 intervals_dir: "data/intervals"
@@ -220,13 +220,20 @@ final_vcf_full: null
 Structure:
   # ───── choose run mode ─────
   run_mode: "bestK"        # "fixed"  or  "bestK", changing to always use bestK
-  ks: [1, 2, 3, 4, 5]   # always the range you want explored, even when you know the bestK, give a range of at least 3
-  bestK: 3          # if run_mode is "fixed", this is the K value to use
+  ks: [1, 2, 3, 4, 5, 6]   # always the range you want explored, even when you know the bestK, give a range of at least 3
+  bestK: 4          # if run_mode is "fixed", this is the K value to use
   replicates: 10
+  missingness_threshold: 0.025  # keep loci with F_MISSING <= this threshold for Structure/PCA input VCF
+  populations: ["DAG", "DAS", "DBM", "DKS", "DPR", "DVB"]  # All diploid populations from metadata
   burnin: 100000 # Number of burn-in iterations
   mcmc: 1000000 # Total number of iterations
-  ploidy: 4 # Ploidy of the organism (default is 2 for diploid)
+  ploidy: 2 # Ploidy of the organism (diploid)
   time: "15-00:00:00" # Time limit for the job, adjust as needed
+
+FST:
+  nboots: 1000
+  percent: 95
+  nclusters: 4
 
 
 PCA:
